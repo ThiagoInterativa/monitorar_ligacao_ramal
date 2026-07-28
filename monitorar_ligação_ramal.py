@@ -3,7 +3,7 @@ import requests
 import plotly.express as px
 import sqlite3
 import pandas as pd
-import json
+import re
 
 # Configuração inicial da página do Streamlit para largura total
 st.set_page_config(layout="wide")
@@ -13,11 +13,17 @@ st.title("📊 Monitoramento e Auditoria Avançada de Chamadas (API CDR Evence)"
 API_TOKEN = "4275c3fd79ac7997e3dc03fb451657518b50d55203c41c8798a3c81eb5825031"
 BASE_URL = "https://pabx.evence.com.br/api/v1/cdr"
 
+def extrair_tecnico(texto_origem):
+    """
+    Extrai o nome do técnico e ramal se o formato for 'Nome' <ramal>
+    Exemplo: '"Ramon Lennon" <105>' vira 'Ramon Lennon (105)'
+    """
+    match = re.search(r'"([^"]+)"\s*<(\d+)>', str(texto_origem))
+    if match:
+        return f"{match.group(1)} (Ramal {match.group(2)})"
+    return str(texto_origem)
+
 def init_db():
-    """
-    Inicializa o banco de dados SQLite local e cria a tabela 'todas_chamadas' 
-    com colunas mapeadas de forma explícita.
-    """
     conn = sqlite3.connect("cdr_nao_atendidas.db")
     cursor = conn.cursor()
     cursor.execute("""
@@ -39,19 +45,15 @@ def init_db():
 init_db()
 
 def salvar_no_banco(registros):
-    """
-    Processa os registros da API mapeando diretamente os índices do array JSON 
-    para as colunas corretas do banco de dados.
-    """
     conn = sqlite3.connect("cdr_nao_atendidas.db")
     cursor = conn.cursor()
     for reg in registros:
         try:
             if len(reg) >= 7:
                 data_hora = str(reg[0]) if len(reg) > 0 else ""
-                origem = str(reg[1]) if len(reg) > 1 else ""
+                origem_bruta = str(reg[1]) if len(reg) > 1 else ""
                 destino = str(reg[2]) if len(reg) > 2 else ""
-                ramal_tecnico = str(reg[3]) if len(reg) > 3 else ""
+                ramal_tecnico = extrair_tecnico(origem_bruta)
                 duracao = str(reg[4]) if len(reg) > 4 else ""
                 status = str(reg[5]) if len(reg) > 5 else ""
                 tipo = str(reg[6]) if len(reg) > 6 else ""
@@ -60,16 +62,13 @@ def salvar_no_banco(registros):
                     INSERT OR IGNORE INTO todas_chamadas 
                     (data_hora, origem, destino, ramal_tecnico, duracao, status, tipo)
                     VALUES (?, ?, ?, ?, ?, ?, ?)
-                """, (data_hora, origem, destino, ramal_tecnico, duracao, status, tipo))
+                """, (data_hora, origem_bruta, destino, ramal_tecnico, duracao, status, tipo))
         except Exception:
             continue
     conn.commit()
     conn.close()
 
 def carregar_do_banco(data_inicio, data_fim):
-    """
-    Carrega todos os dados do banco local e aplica o filtro de período.
-    """
     conn = sqlite3.connect("cdr_nao_atendidas.db")
     query = "SELECT * FROM todas_chamadas"
     df = pd.read_sql_query(query, conn)
@@ -88,35 +87,24 @@ menu = st.sidebar.radio("Escolha a Opção", ["Dashboard Geral", "🔍 Auditoria
 data_inicio = st.sidebar.date_input("Data início")
 data_fim = st.sidebar.date_input("Data fim")
 
-# Botão de Sincronização Global com a API da Evence
 if st.sidebar.button("Sincronizar Dados da API Evence"):
     indice = 0
     total_inseridos = 0
     sucesso_busca = False
-    
-    # Armazena a última resposta bruta para fins de inspeção/debug
     st.session_state["ultimo_json_bruto"] = {}
     
     with st.spinner("Buscando registros na API de CDR..."):
         while True:
             url = f"{BASE_URL}?api_token={API_TOKEN}&datainicio={data_inicio}&datafinal={data_fim}&indice={indice}"
-            
             try:
                 response = requests.get(url)
-                if response.status_code == 404:
+                if response.status_code == 404 or response.status_code != 200:
                     break
-                if response.status_code != 200:
-                    st.error(f"Erro na API: Status {response.status_code}")
-                    break
-                
                 data = response.json()
                 if "error" in data:
-                    st.error(f"Erro retornado pela API: {data['error']}")
                     break
                 
-                # Guarda o JSON bruto na sessão para inspecionar depois
                 st.session_state["ultimo_json_bruto"] = data
-                
                 cdr_dict = data.get("cdr", {})
                 if not cdr_dict:
                     break 
@@ -130,8 +118,7 @@ if st.sidebar.button("Sincronizar Dados da API Evence"):
                 
                 if len(lista_registros) == 0:
                     break
-            except Exception as e:
-                st.error(f"Erro de conexão: {e}")
+            except Exception:
                 break
                 
     if sucesso_busca or total_inseridos > 0:
@@ -139,55 +126,52 @@ if st.sidebar.button("Sincronizar Dados da API Evence"):
     else:
         st.sidebar.warning("Nenhum registro retornado pela API para este período.")
 
-# Seção de Debug na Barra Lateral para inspecjonar o log cru da API
 with st.sidebar.expander("🛠️ Inspecionar Log Bruto da API"):
     if "ultimo_json_bruto" in st.session_state and st.session_state["ultimo_json_bruto"]:
-        st.write("Estrutura exata recebida da Evence:")
         st.json(st.session_state["ultimo_json_bruto"])
     else:
         st.info("Clique em 'Sincronizar Dados da API Evence' para capturar o log bruto.")
 
-# Carrega a base geral filtrada por período
 df_geral = carregar_do_banco(data_inicio, data_fim)
 
 # ==========================================
 # OPÇÃO 1: DASHBOARD GERAL
 # ==========================================
 if menu == "Dashboard Geral":
-    st.subheader(f"📊 Painel de Chamadas Não Atendidas ({data_inicio} a {data_fim})")
+    st.subheader(f"📊 Painel de Chamadas ({data_inicio} a {data_fim})")
     
     if not df_geral.empty:
-        df_nao_atendidas = df_geral[df_geral["status"].str.lower().str.contains("não atendida", na=False)]
+        df_nao_atendidas = df_geral[df_geral["status"].str.lower().str.contains("abandonada", na=False)]
         
         if not df_nao_atendidas.empty:
             contagem = df_nao_atendidas["ramal_tecnico"].value_counts().reset_index()
-            contagem.columns = ["Ramal / Técnico", "Quantidade Não Atendida"]
+            contagem.columns = ["Técnico / Origem", "Quantidade"]
 
             cols = st.columns(4)
-            for i, row in contagem.iterrows():
-                cols[i % 4].metric(f"Ramal {row['Ramal / Técnico']}", int(row['Quantidade Não Atendida']))
+            for i, row in contagem.head(4).iterrows():
+                cols[i % 4].metric(str(row['Técnico / Origem']), int(row['Quantidade']))
 
             fig = px.pie(
                 contagem,
-                names="Ramal / Técnico",
-                values="Quantidade Não Atendida",
-                title="Proporção de Chamadas Não Atendidas por Ramal"
+                names="Técnico / Origem",
+                values="Quantidade",
+                title="Proporção de Chamadas Não Atendidas / Abandonadas"
             )
             st.plotly_chart(fig, use_container_width=True)
 
-            st.subheader("Detalhamento Geral de Chamadas Perdidas")
+            st.subheader("Detalhamento Geral")
             st.dataframe(df_nao_atendidas[["data_hora", "origem", "destino", "ramal_tecnico", "status", "tipo"]])
         else:
-            st.info("Nenhuma chamada 'Não Atendida' registrada neste período.")
+            st.info("Nenhuma chamada abandonada registrada neste período.")
     else:
-        st.info("Banco de dados vazio para este período. Clique em 'Sincronizar Dados da API Evence' na barra lateral.")
+        st.info("Banco de dados vazio para este período. Sincronize os dados.")
 
 # ==========================================
 # OPÇÃO 2: AUDITORIA DE LOG POR TELEFONE
 # ==========================================
 elif menu == "🔍 Auditoria de Log por Telefone":
     st.subheader("🔍 Rastreio e Auditoria de Chamada por Número de Cliente")
-    st.markdown("Digite o número do telefone do cliente (ou parte dele) para mapear todas as tentativas, transbordos e ramais por onde a ligação passou.")
+    st.markdown("Digite o número do telefone do cliente para rastrear por onde passou.")
     
     telefone_busca = st.text_input("Número do Telefone do Cliente:", "")
     
@@ -199,27 +183,25 @@ elif menu == "🔍 Auditoria de Log por Telefone":
             ]
             
             if not df_cliente.empty:
-                st.success(f"Encontrados {len(df_cliente)} registros de movimentação para o número: **{telefone_busca}**")
-                
+                st.success(f"Encontrados {len(df_cliente)} registros para o número: **{telefone_busca}**")
                 df_cliente = df_cliente.sort_values(by="data_obj", ascending=True)
                 
                 st.markdown("### 🕒 Linha do Tempo Completa da Chamada")
                 for idx, row in df_cliente.iterrows():
                     status_str = str(row["status"])
-                    status_cor = "🔴" if "não atendida" in status_str.lower() else "🟢"
+                    status_cor = "🔴" if "abandonada" in status_str.lower() else "🟢"
                     
                     st.markdown(f"""
                     * **{status_cor} Data/Hora:** `{row['data_hora']}`  
-                      * **Origem:** `{row['origem']}` | **Destino:** `{row['destino']}`  
-                      * **Ramal / Técnico:** `{row['ramal_tecnico']}`  
+                      * **Origem/Técnico Identificado:** `{row['ramal_tecnico']}`  
+                      * **Destino:** `{row['destino']}`  
                       * **Status:** `{status_str}` | **Tipo:** `{row['tipo']}` | **Duração:** `{row['duracao']}`
                     """)
                 
                 st.markdown("---")
-                st.subheader("Tabela Analítica Completa do Número")
+                st.subheader("Tabela Analítica Completa")
                 st.dataframe(df_cliente[["data_hora", "origem", "destino", "ramal_tecnico", "status", "tipo", "duracao"]])
-                
             else:
-                st.warning(f"Nenhum registro encontrado para o número '{telefone_busca}' no período selecionado.")
+                st.warning(f"Nenhum registro encontrado para '{telefone_busca}'.")
         else:
-            st.warning("Carregue os dados sincronizando a API primeiro.")
+                st.warning("Sincronize a API primeiro.")
