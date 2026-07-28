@@ -13,30 +13,31 @@ st.title("📊 Monitoramento e Auditoria Avançada de Chamadas (API CDR Evence)"
 API_TOKEN = "4275c3fd79ac7997e3dc03fb451657518b50d55203c41c8798a3c81eb5825031"
 BASE_URL = "https://pabx.evence.com.br/api/v1/cdr"
 
-def extrair_tecnico(texto_origem):
+def extrair_info_tecnico(texto):
     """
-    Extrai o nome do técnico e ramal se o formato for 'Nome' <ramal>
-    Exemplo: '"Ramon Lennon" <105>' vira 'Ramon Lennon (105)'
+    Extrai o nome do técnico e ramal se o formato contiver Padrão Asterisk ex: 'Nome' <ramal>
     """
-    match = re.search(r'"([^"]+)"\s*<(\d+)>', str(texto_origem))
+    match = re.search(r'"([^"]+)"\s*<(\d+)>', str(texto))
     if match:
         return f"{match.group(1)} (Ramal {match.group(2)})"
-    return str(texto_origem)
+    return str(texto)
 
 def init_db():
     conn = sqlite3.connect("cdr_nao_atendidas.db")
     cursor = conn.cursor()
+    cursor.execute("DROP TABLE IF EXISTS todas_chamadas")
     cursor.execute("""
-        CREATE TABLE IF NOT EXISTS todas_chamadas (
+        CREATE TABLE todas_chamadas (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             data_hora TEXT,
             origem TEXT,
             destino TEXT,
-            ramal_tecnico TEXT,
+            canal_ramal TEXT,
             duracao TEXT,
             status TEXT,
             tipo TEXT,
-            UNIQUE(data_hora, origem, destino, ramal_tecnico)
+            tecnico_formatado TEXT,
+            UNIQUE(data_hora, origem, destino, canal_ramal, tipo)
         )
     """)
     conn.commit()
@@ -51,18 +52,22 @@ def salvar_no_banco(registros):
         try:
             if len(reg) >= 7:
                 data_hora = str(reg[0]) if len(reg) > 0 else ""
-                origem_bruta = str(reg[1]) if len(reg) > 1 else ""
+                origem = str(reg[1]) if len(reg) > 1 else ""
                 destino = str(reg[2]) if len(reg) > 2 else ""
-                ramal_tecnico = extrair_tecnico(origem_bruta)
+                canal_ramal = str(reg[3]) if len(reg) > 3 else ""
                 duracao = str(reg[4]) if len(reg) > 4 else ""
                 status = str(reg[5]) if len(reg) > 5 else ""
                 tipo = str(reg[6]) if len(reg) > 6 else ""
 
+                tecnico_formatado = extrair_info_tecnico(origem)
+                if tecnico_formatado == origem and canal_ramal:
+                    tecnico_formatado = extrair_info_tecnico(canal_ramal)
+
                 cursor.execute("""
                     INSERT OR IGNORE INTO todas_chamadas 
-                    (data_hora, origem, destino, ramal_tecnico, duracao, status, tipo)
-                    VALUES (?, ?, ?, ?, ?, ?, ?)
-                """, (data_hora, origem_bruta, destino, ramal_tecnico, duracao, status, tipo))
+                    (data_hora, origem, destino, canal_ramal, duracao, status, tipo, tecnico_formatado)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """, (data_hora, origem, destino, canal_ramal, duracao, status, tipo, tecnico_formatado))
         except Exception:
             continue
     conn.commit()
@@ -141,10 +146,10 @@ if menu == "Dashboard Geral":
     st.subheader(f"📊 Painel de Chamadas ({data_inicio} a {data_fim})")
     
     if not df_geral.empty:
-        df_nao_atendidas = df_geral[df_geral["status"].str.lower().str.contains("abandonada", na=False)]
+        df_abandonadas = df_geral[df_geral["status"].str.lower().str.contains("abandonada", na=False)]
         
-        if not df_nao_atendidas.empty:
-            contagem = df_nao_atendidas["ramal_tecnico"].value_counts().reset_index()
+        if not df_abandonadas.empty:
+            contagem = df_abandonadas["tecnico_formatado"].value_counts().reset_index()
             contagem.columns = ["Técnico / Origem", "Quantidade"]
 
             cols = st.columns(4)
@@ -155,12 +160,12 @@ if menu == "Dashboard Geral":
                 contagem,
                 names="Técnico / Origem",
                 values="Quantidade",
-                title="Proporção de Chamadas Não Atendidas / Abandonadas"
+                title="Proporção de Chamadas Abandonadas"
             )
             st.plotly_chart(fig, use_container_width=True)
 
             st.subheader("Detalhamento Geral")
-            st.dataframe(df_nao_atendidas[["data_hora", "origem", "destino", "ramal_tecnico", "status", "tipo"]])
+            st.dataframe(df_abandonadas[["data_hora", "origem", "destino", "canal_ramal", "status", "tipo"]])
         else:
             st.info("Nenhuma chamada abandonada registrada neste período.")
     else:
@@ -179,7 +184,8 @@ elif menu == "🔍 Auditoria de Log por Telefone":
         if not df_geral.empty:
             df_cliente = df_geral[
                 df_geral["origem"].astype(str).str.contains(telefone_busca, na=False) | 
-                df_geral["destino"].astype(str).str.contains(telefone_busca, na=False)
+                df_geral["destino"].astype(str).str.contains(telefone_busca, na=False) |
+                df_geral["canal_ramal"].astype(str).str.contains(telefone_busca, na=False)
             ]
             
             if not df_cliente.empty:
@@ -191,17 +197,31 @@ elif menu == "🔍 Auditoria de Log por Telefone":
                     status_str = str(row["status"])
                     status_cor = "🔴" if "abandonada" in status_str.lower() else "🟢"
                     
+                    # Inteligência de cruzamento: se for entrada sem nome, procura se houve evento de técnico no mesmo minuto/segundo
+                    agente_info = row['tecnico_formatado']
+                    if not agente_info or agente_info == telefone_busca or agente_info == "":
+                        # Tenta buscar na base geral se ocorreu algum evento de ramal exatamente no mesmo timestamp
+                        match_parceiro = df_geral[
+                            (df_geral["data_hora"] == row["data_hora"]) & 
+                            (df_geral["tipo"].str.lower() == "interna")
+                        ]
+                        if not match_parceiro.empty:
+                            agente_info = " / ".join(match_parceiro["tecnico_formatado"].unique())
+                        else:
+                            agente_info = "Fila de Atendimento Geral (Sem ramal explícito na API)"
+                    
                     st.markdown(f"""
                     * **{status_cor} Data/Hora:** `{row['data_hora']}`  
-                      * **Origem/Técnico Identificado:** `{row['ramal_tecnico']}`  
-                      * **Destino:** `{row['destino']}`  
+                      * **Número do Cliente:** `{row['origem']}`  
+                      * **Canal / Info PABX:** `{row['canal_ramal'] if row['canal_ramal'] else 'N/D'}`  
+                      * **Atendente / Técnico Envolvido:** `{agente_info}`  
                       * **Status:** `{status_str}` | **Tipo:** `{row['tipo']}` | **Duração:** `{row['duracao']}`
                     """)
                 
                 st.markdown("---")
                 st.subheader("Tabela Analítica Completa")
-                st.dataframe(df_cliente[["data_hora", "origem", "destino", "ramal_tecnico", "status", "tipo", "duracao"]])
+                st.dataframe(df_cliente[["data_hora", "origem", "destino", "canal_ramal", "tecnico_formatado", "status", "tipo", "duracao"]])
             else:
                 st.warning(f"Nenhum registro encontrado para '{telefone_busca}'.")
         else:
-                st.warning("Sincronize a API primeiro.")
+            st.warning("Sincronize a API primeiro.")
