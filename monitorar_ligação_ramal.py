@@ -3,7 +3,7 @@ import requests
 import plotly.express as px
 import sqlite3
 import pandas as pd
-import io
+import json
 
 # Configuração inicial da página do Streamlit para largura total
 st.set_page_config(layout="wide")
@@ -16,7 +16,7 @@ BASE_URL = "https://pabx.evence.com.br/api/v1/cdr"
 def init_db():
     """
     Inicializa o banco de dados SQLite local e cria a tabela 'todas_chamadas' 
-    com colunas mapeadas de forma explícita para evitar erros.
+    com colunas mapeadas de forma explícita.
     """
     conn = sqlite3.connect("cdr_nao_atendidas.db")
     cursor = conn.cursor()
@@ -47,7 +47,6 @@ def salvar_no_banco(registros):
     cursor = conn.cursor()
     for reg in registros:
         try:
-            # Mapeamento explícito baseado na estrutura real da Evence
             if len(reg) >= 7:
                 data_hora = str(reg[0]) if len(reg) > 0 else ""
                 origem = str(reg[1]) if len(reg) > 1 else ""
@@ -95,6 +94,9 @@ if st.sidebar.button("Sincronizar Dados da API Evence"):
     total_inseridos = 0
     sucesso_busca = False
     
+    # Armazena a última resposta bruta para fins de inspeção/debug
+    st.session_state["ultimo_json_bruto"] = {}
+    
     with st.spinner("Buscando registros na API de CDR..."):
         while True:
             url = f"{BASE_URL}?api_token={API_TOKEN}&datainicio={data_inicio}&datafinal={data_fim}&indice={indice}"
@@ -111,6 +113,9 @@ if st.sidebar.button("Sincronizar Dados da API Evence"):
                 if "error" in data:
                     st.error(f"Erro retornado pela API: {data['error']}")
                     break
+                
+                # Guarda o JSON bruto na sessão para inspecionar depois
+                st.session_state["ultimo_json_bruto"] = data
                 
                 cdr_dict = data.get("cdr", {})
                 if not cdr_dict:
@@ -133,6 +138,14 @@ if st.sidebar.button("Sincronizar Dados da API Evence"):
         st.sidebar.success(f"Sincronização concluída! {total_inseridos} registros processados.")
     else:
         st.sidebar.warning("Nenhum registro retornado pela API para este período.")
+
+# Seção de Debug na Barra Lateral para inspecjonar o log cru da API
+with st.sidebar.expander("🛠️ Inspecionar Log Bruto da API"):
+    if "ultimo_json_bruto" in st.session_state and st.session_state["ultimo_json_bruto"]:
+        st.write("Estrutura exata recebida da Evence:")
+        st.json(st.session_state["ultimo_json_bruto"])
+    else:
+        st.info("Clique em 'Sincronizar Dados da API Evence' para capturar o log bruto.")
 
 # Carrega a base geral filtrada por período
 df_geral = carregar_do_banco(data_inicio, data_fim)
@@ -180,7 +193,6 @@ elif menu == "🔍 Auditoria de Log por Telefone":
     
     if telefone_busca:
         if not df_geral.empty:
-            # Filtro cruzando origem ou destino
             df_cliente = df_geral[
                 df_geral["origem"].astype(str).str.contains(telefone_busca, na=False) | 
                 df_geral["destino"].astype(str).str.contains(telefone_busca, na=False)
