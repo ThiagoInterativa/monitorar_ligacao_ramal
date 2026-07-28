@@ -4,9 +4,10 @@ import plotly.express as px
 import sqlite3
 import pandas as pd
 import io
+import re
 
 st.set_page_config(layout="wide")
-st.title("📊 Monitoramento e Auditoria de Ramais (API CDR Evence)")
+st.title("📊 Monitoramento e Auditoria Avançada de Chamadas (API CDR Evence)")
 
 # ===== CONFIGURAÇÃO DA API E BANCO =====
 API_TOKEN = "4275c3fd79ac7997e3dc03fb451657518b50d55203c41c8798a3c81eb5825031"
@@ -15,7 +16,7 @@ BASE_URL = "https://pabx.evence.com.br/api/v1/cdr"
 def init_db():
     conn = sqlite3.connect("cdr_nao_atendidas.db")
     cursor = conn.cursor()
-    # Criamos uma tabela que guarda TUDO (atendidas e não atendidas) para permitir o rastreio completo da jornada
+    # Criamos uma tabela flexível para armazenar todas as posições do array do CDR
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS todas_chamadas (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -26,6 +27,8 @@ def init_db():
             duracao TEXT,
             status TEXT,
             tipo TEXT,
+            extra_col1 TEXT,
+            extra_col2 TEXT,
             UNIQUE(data_hora, origem, destino, ramal_tecnico)
         )
     """)
@@ -40,15 +43,29 @@ def salvar_no_banco(registros):
     for reg in registros:
         try:
             if len(reg) >= 7:
-                data_hora, origem, destino, ramal, duracao, status, tipo = reg[0], reg[1], reg[2], reg[3], reg[4], reg[5], reg[6]
+                data_hora = reg[0]
+                origem = reg[1]
+                destino = reg[2]
+                ramal = str(reg[3]) if len(reg) > 3 else ""
+                duracao = reg[4]
+                status = reg[5]
+                tipo = reg[6]
+                extra1 = str(reg[7]) if len(reg) > 7 else ""
+                extra2 = str(reg[8]) if len(reg) > 8 else ""
                 
-                # Salvamos TODAS as chamadas para permitir o rastreio da jornada do cliente
+                # Tenta extrair número de ramal caso venha formatado como "Nome < 108 >"
+                match_ramal = re.search(r'<\s*(\d+)\s*>', destino + " " + ramal + " " + extra1)
+                if match_ramal:
+                    ramal_limpo = match_ramal.group(1)
+                else:
+                    ramal_limpo = ramal
+
                 cursor.execute("""
                     INSERT OR IGNORE INTO todas_chamadas 
-                    (data_hora, origem, destino, ramal_tecnico, duracao, status, tipo)
-                    VALUES (?, ?, ?, ?, ?, ?, ?)
-                """, (data_hora, origem, destino, ramal, duracao, status, tipo))
-        except Exception:
+                    (data_hora, origem, destino, ramal_tecnico, duracao, status, tipo, extra_col1, extra_col2)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """, (data_hora, origem, destino, ramal_limpo, duracao, status, tipo, extra1, extra2))
+        except Exception as e:
             continue
     conn.commit()
     conn.close()
@@ -127,7 +144,6 @@ if menu == "Dashboard Geral":
     st.subheader(f"📊 Painel de Chamadas Não Atendidas ({data_inicio} a {data_fim})")
     
     if not df_geral.empty:
-        # Filtra apenas não atendidas para o dashboard geral
         df_nao_atendidas = df_geral[df_geral["status"].str.lower().str.contains("não atendida", na=False)]
         
         if not df_nao_atendidas.empty:
@@ -158,14 +174,17 @@ if menu == "Dashboard Geral":
 # ==========================================
 elif menu == "🔍 Auditoria de Log por Telefone":
     st.subheader("🔍 Rastreio e Auditoria de Chamada por Número de Cliente")
-    st.markdown("Digite o número do telefone do cliente para rastrear toda a jornada da ligação (por onde passou, qual ramal tocou, quem recusou/ignorou e quem atendeu depois).")
+    st.markdown("Digite o número do telefone do cliente (ou parte dele) para mapear todas as tentativas, transbordos e ramais por onde a ligação passou.")
     
-    telefone_busca = st.text_input("Número do Telefone do Cliente (Ex: 11999998888 ou parte dele):", "")
+    telefone_busca = st.text_input("Número do Telefone do Cliente:", "")
     
     if telefone_busca:
         if not df_geral.empty:
-            # Filtra o dataframe geral pelo número de origem contendo o texto digitado
-            df_cliente = df_geral[df_geral["origem"].astype(str).str.contains(telefone_busca, na=False)]
+            # Filtra o dataframe geral pelo número de origem ou destino contendo o texto digitado
+            df_cliente = df_geral[
+                df_geral["origem"].astype(str).str.contains(telefone_busca, na=False) | 
+                df_geral["destino"].astype(str).str.contains(telefone_busca, na=False)
+            ]
             
             if not df_cliente.empty:
                 st.success(f"Encontrados {len(df_cliente)} registros de movimentação para o número: **{telefone_busca}**")
@@ -173,21 +192,22 @@ elif menu == "🔍 Auditoria de Log por Telefone":
                 # Ordena cronologicamente
                 df_cliente = df_cliente.sort_values(by="data_obj", ascending=True)
                 
-                # Exibe a linha do tempo da chamada
-                st.markdown("### 🕒 Linha do Tempo da Chamada (Jornada do Cliente)")
+                st.markdown("### 🕒 Linha do Tempo Completa da Chamada")
                 for idx, row in df_cliente.iterrows():
-                    status_cor = "🔴" if "não atendida" in str(row["status"]).lower() else "🟢"
+                    status_str = str(row["status"])
+                    status_cor = "🔴" if "não atendida" in status_str.lower() else "🟢"
+                    
                     st.markdown(f"""
-                    * **{status_cor} Horário:** `{row['data_hora']}`  
-                      * **Origem (Cliente):** `{row['origem']}`  
-                      * **Ramal Envolvido:** `{row['ramal_tecnico']}`  
-                      * **Status da Ação:** `{row['status']}`  
-                      * **Tipo:** `{row['tipo']}` | **Duração:** `{row['duracao']}`
+                    * **{status_cor} Data/Hora:** `{row['data_hora']}`  
+                      * **Origem:** `{row['origem']}` | **Destino/Info:** `{row['destino']}`  
+                      * **Ramal Identificado:** `Ramal {row['ramal_tecnico']}`  
+                      * **Status:** `{status_str}` | **Tipo:** `{row['tipo']}` | **Duração:** `{row['duracao']}`  
+                      * **Detalhes Extras:** `{row['extra_col1']} | {row['extra_col2']}`
                     """)
                 
                 st.markdown("---")
-                st.subheader("Tabela Analítica do Cliente")
-                st.dataframe(df_cliente[["data_hora", "origem", "ramal_tecnico", "status", "duracao", "tipo"]])
+                st.subheader("Tabela Analítica Completa do Número")
+                st.dataframe(df_cliente[["data_hora", "origem", "destino", "ramal_tecnico", "status", "tipo", "duracao", "extra_col1", "extra_col2"]])
                 
             else:
                 st.warning(f"Nenhum registro encontrado para o número '{telefone_busca}' no período selecionado.")
