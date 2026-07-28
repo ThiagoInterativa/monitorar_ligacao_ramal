@@ -13,18 +13,22 @@ st.title("📊 Monitoramento e Auditoria Avançada de Chamadas (API CDR Evence)"
 API_TOKEN = "4275c3fd79ac7997e3dc03fb451657518b50d55203c41c8798a3c81eb5825031"
 BASE_URL = "https://pabx.evence.com.br/api/v1/cdr"
 
-def extrair_info_tecnico(texto):
+def extrair_tecnico_completo(linha_registro):
     """
-    Extrai o nome do técnico e ramal se o formato contiver Padrão Asterisk ex: 'Nome' <ramal>
+    Varre todos os campos de um registro bruto da API em busca do padrão 'Nome <ramal>'.
     """
-    match = re.search(r'"([^"]+)"\s*<(\d+)>', str(texto))
+    texto_concatenado = " ".join([str(item) for item in linha_registro])
+    match = re.search(r'"?([^"<]+)"?\s*<(\d+)>', texto_concatenado)
     if match:
-        return f"{match.group(1)} (Ramal {match.group(2)})"
-    return str(texto)
+        nome = match.group(1).strip().replace('"', '')
+        ramal = match.group(2).strip()
+        return f"{nome} (Ramal {ramal})"
+    return ""
 
 def init_db():
     conn = sqlite3.connect("cdr_nao_atendidas.db")
     cursor = conn.cursor()
+    # Recria a tabela para garantir a nova estrutura flexível
     cursor.execute("DROP TABLE IF EXISTS todas_chamadas")
     cursor.execute("""
         CREATE TABLE todas_chamadas (
@@ -36,8 +40,7 @@ def init_db():
             duracao TEXT,
             status TEXT,
             tipo TEXT,
-            tecnico_formatado TEXT,
-            UNIQUE(data_hora, origem, destino, canal_ramal, tipo)
+            tecnico_formatado TEXT
         )
     """)
     conn.commit()
@@ -50,21 +53,22 @@ def salvar_no_banco(registros):
     cursor = conn.cursor()
     for reg in registros:
         try:
-            if len(reg) >= 7:
+            if len(reg) >= 6:
                 data_hora = str(reg[0]) if len(reg) > 0 else ""
                 origem = str(reg[1]) if len(reg) > 1 else ""
                 destino = str(reg[2]) if len(reg) > 2 else ""
                 canal_ramal = str(reg[3]) if len(reg) > 3 else ""
                 duracao = str(reg[4]) if len(reg) > 4 else ""
                 status = str(reg[5]) if len(reg) > 5 else ""
-                tipo = str(reg[6]) if len(reg) > 6 else ""
+                tipo = str(reg[6]) if len(reg) > 6 else "Desconhecido"
 
-                tecnico_formatado = extrair_info_tecnico(origem)
-                if tecnico_formatado == origem and canal_ramal:
-                    tecnico_formatado = extrair_info_tecnico(canal_ramal)
+                # Extrai o técnico varrendo toda a linha do CDR
+                tecnico_formatado = extrair_tecnico_completo(reg)
+                if not tecnico_formatado:
+                    tecnico_formatado = "Fila de Atendimento Geral"
 
                 cursor.execute("""
-                    INSERT OR IGNORE INTO todas_chamadas 
+                    INSERT INTO todas_chamadas 
                     (data_hora, origem, destino, canal_ramal, duracao, status, tipo, tecnico_formatado)
                     VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                 """, (data_hora, origem, destino, canal_ramal, duracao, status, tipo, tecnico_formatado))
@@ -103,7 +107,7 @@ if st.sidebar.button("Sincronizar Dados da API Evence"):
             url = f"{BASE_URL}?api_token={API_TOKEN}&datainicio={data_inicio}&datafinal={data_fim}&indice={indice}"
             try:
                 response = requests.get(url)
-                if response.status_code == 404 or response.status_code != 200:
+                if response.status_code != 200:
                     break
                 data = response.json()
                 if "error" in data:
@@ -165,7 +169,7 @@ if menu == "Dashboard Geral":
             st.plotly_chart(fig, use_container_width=True)
 
             st.subheader("Detalhamento Geral")
-            st.dataframe(df_abandonadas[["data_hora", "origem", "destino", "canal_ramal", "status", "tipo"]])
+            st.dataframe(df_abandonadas[["data_hora", "origem", "destino", "tecnico_formatado", "status", "tipo"]])
         else:
             st.info("Nenhuma chamada abandonada registrada neste período.")
     else:
@@ -176,7 +180,7 @@ if menu == "Dashboard Geral":
 # ==========================================
 elif menu == "🔍 Auditoria de Log por Telefone":
     st.subheader("🔍 Rastreio e Auditoria de Chamada por Número de Cliente")
-    st.markdown("Digite o número do telefone do cliente para rastrear por onde passou.")
+    st.markdown("Digite o número do telefone do cliente para rastrear por onde passou a ligação.")
     
     telefone_busca = st.text_input("Número do Telefone do Cliente:", "")
     
@@ -189,39 +193,32 @@ elif menu == "🔍 Auditoria de Log por Telefone":
             ]
             
             if not df_cliente.empty:
-                st.success(f"Encontrados {len(df_cliente)} registros para o número: **{telefone_busca}**")
+                st.success(f"Encontrados {len(df_cliente)} eventos de PABX para o número: **{telefone_busca}**")
                 df_cliente = df_cliente.sort_values(by="data_obj", ascending=True)
                 
-                st.markdown("### 🕒 Linha do Tempo Completa da Chamada")
+                st.markdown("### 🕒 Linha do Tempo e Trilha de Auditoria")
                 for idx, row in df_cliente.iterrows():
                     status_str = str(row["status"])
                     status_cor = "🔴" if "abandonada" in status_str.lower() else "🟢"
                     
-                    # Inteligência de cruzamento: se for entrada sem nome, procura se houve evento de técnico no mesmo minuto/segundo
-                    agente_info = row['tecnico_formatado']
-                    if not agente_info or agente_info == telefone_busca or agente_info == "":
-                        # Tenta buscar na base geral se ocorreu algum evento de ramal exatamente no mesmo timestamp
-                        match_parceiro = df_geral[
-                            (df_geral["data_hora"] == row["data_hora"]) & 
-                            (df_geral["tipo"].str.lower() == "interna")
-                        ]
-                        if not match_parceiro.empty:
-                            agente_info = " / ".join(match_parceiro["tecnico_formatado"].unique())
-                        else:
-                            agente_info = "Fila de Atendimento Geral (Sem ramal explícito na API)"
-                    
                     st.markdown(f"""
                     * **{status_cor} Data/Hora:** `{row['data_hora']}`  
-                      * **Número do Cliente:** `{row['origem']}`  
-                      * **Canal / Info PABX:** `{row['canal_ramal'] if row['canal_ramal'] else 'N/D'}`  
-                      * **Atendente / Técnico Envolvido:** `{agente_info}`  
-                      * **Status:** `{status_str}` | **Tipo:** `{row['tipo']}` | **Duração:** `{row['duracao']}`
+                      * **Origem (Bina):** `{row['origem']}`  
+                      * **Destino / Fila:** `{row['destino']}`  
+                      * **Atendente / Técnico Envolvido:** `⭐ {row['tecnico_formatado']}`  
+                      * **Status:** `{status_str}` | **Tipo da Chamada:** `{row['tipo']}` | **Duração:** `{row['duracao']}`
                     """)
                 
                 st.markdown("---")
-                st.subheader("Tabela Analítica Completa")
+                st.subheader("Tabela Analítica Completa para Auditoria")
                 st.dataframe(df_cliente[["data_hora", "origem", "destino", "canal_ramal", "tecnico_formatado", "status", "tipo", "duracao"]])
             else:
-                st.warning(f"Nenhum registro encontrado para '{telefone_busca}'.")
+                st.warning(f"Nenhum registro encontrado para '{telefone_busca}'. Verifique se o período das datas abrange esse dia.")
         else:
             st.warning("Sincronize a API primeiro.")
+
+---
+
+### O que mudou e como isso ajuda na auditoria?
+* **Varredura Global em Arrays:** O script agora lê todos os campos da linha do CDR de uma só vez. Se o nome do **Gabriel Tomaz** estiver em qualquer canto da linha, ele será capturado imediatamente.
+* **Sem Duplicações Perdidas:** Agora o banco armazena todas as etapas da chamada. Se ela passou pela fila geral e depois foi direcionada para um ramal, ambos os eventos ficam visíveis para cruzamento de auditoria.
