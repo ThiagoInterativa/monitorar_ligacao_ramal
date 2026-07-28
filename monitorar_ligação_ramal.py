@@ -4,9 +4,8 @@ import plotly.express as px
 import sqlite3
 import pandas as pd
 import io
-import re
 
-# Configuração inicial da página do Streamlit
+# Configuração inicial da página do Streamlit para largura total
 st.set_page_config(layout="wide")
 st.title("📊 Monitoramento e Auditoria Avançada de Chamadas (API CDR Evence)")
 
@@ -16,8 +15,8 @@ BASE_URL = "https://pabx.evence.com.br/api/v1/cdr"
 
 def init_db():
     """
-    Inicializa o banco de dados SQLite local e garante que a tabela 
-    e todas as colunas necessárias existam.
+    Inicializa o banco de dados SQLite local e cria a tabela 'todas_chamadas' 
+    com colunas mapeadas de forma explícita para evitar erros.
     """
     conn = sqlite3.connect("cdr_nao_atendidas.db")
     cursor = conn.cursor()
@@ -31,8 +30,6 @@ def init_db():
             duracao TEXT,
             status TEXT,
             tipo TEXT,
-            extra_col1 TEXT,
-            extra_col2 TEXT,
             UNIQUE(data_hora, origem, destino, ramal_tecnico)
         )
     """)
@@ -43,45 +40,28 @@ init_db()
 
 def salvar_no_banco(registros):
     """
-    Processa os registros brutos vindos da API da Evence, varre todas as posições 
-    em busca de padrões de ramal (como '< 108 >', 'Ramal 106', etc.) e salva no banco.
+    Processa os registros da API mapeando diretamente os índices do array JSON 
+    para as colunas corretas do banco de dados.
     """
     conn = sqlite3.connect("cdr_nao_atendidas.db")
     cursor = conn.cursor()
     for reg in registros:
         try:
+            # Mapeamento explícito baseado na estrutura real da Evence
             if len(reg) >= 7:
-                data_hora = reg[0]
-                origem = reg[1]
-                destino = reg[2]
-                ramal = str(reg[3]) if len(reg) > 3 else ""
-                duracao = reg[4]
-                status = reg[5]
-                tipo = reg[6]
-                extra1 = str(reg[7]) if len(reg) > 7 else ""
-                extra2 = str(reg[8]) if len(reg) > 8 else ""
-                
-                # Junta todas as colunas em uma única string de busca para encontrar o ramal onde quer que ele esteja
-                linha_completa = f"{origem} {destino} {ramal} {extra1} {extra2}"
-                
-                # Tenta extrair padrões comuns de ramal (ex: < 108 >, Ramal 106, ou números isolados de 3 a 4 dígitos se coerente)
-                match_ramal = re.search(r'(?:ramal\s*[:#-]?\s*|<?\s*)(\d{3,4})(?:\s*>)?', linha_completa, re.IGNORECASE)
-                
-                # Se não achar por regex comum, procura por números entre colchetes/parênteses típicos de PABX
-                if not match_ramal:
-                    match_ramal = re.search(r'<\s*(\d+)\s*>', linha_completa)
-
-                if match_ramal:
-                    ramal_limpo = match_ramal.group(1)
-                else:
-                    # Se nenhum padrão for encontrado, usa o destino se ele for curto o bastante para ser um ramal
-                    ramal_limpo = destino if len(str(destino)) <= 4 else ""
+                data_hora = str(reg[0]) if len(reg) > 0 else ""
+                origem = str(reg[1]) if len(reg) > 1 else ""
+                destino = str(reg[2]) if len(reg) > 2 else ""
+                ramal_tecnico = str(reg[3]) if len(reg) > 3 else ""
+                duracao = str(reg[4]) if len(reg) > 4 else ""
+                status = str(reg[5]) if len(reg) > 5 else ""
+                tipo = str(reg[6]) if len(reg) > 6 else ""
 
                 cursor.execute("""
                     INSERT OR IGNORE INTO todas_chamadas 
-                    (data_hora, origem, destino, ramal_tecnico, duracao, status, tipo, extra_col1, extra_col2)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """, (data_hora, origem, destino, ramal_limpo, duracao, status, tipo, extra1, extra2))
+                    (data_hora, origem, destino, ramal_tecnico, duracao, status, tipo)
+                    VALUES (?, ?, ?, ?, ?, ?, ?)
+                """, (data_hora, origem, destino, ramal_tecnico, duracao, status, tipo))
         except Exception:
             continue
     conn.commit()
@@ -89,7 +69,7 @@ def salvar_no_banco(registros):
 
 def carregar_do_banco(data_inicio, data_fim):
     """
-    Carrega os dados salvos no banco SQLite e aplica o filtro de datas.
+    Carrega todos os dados do banco local e aplica o filtro de período.
     """
     conn = sqlite3.connect("cdr_nao_atendidas.db")
     query = "SELECT * FROM todas_chamadas"
@@ -200,7 +180,7 @@ elif menu == "🔍 Auditoria de Log por Telefone":
     
     if telefone_busca:
         if not df_geral.empty:
-            # Filtro seguro buscando o número tanto na origem quanto no destino
+            # Filtro cruzando origem ou destino
             df_cliente = df_geral[
                 df_geral["origem"].astype(str).str.contains(telefone_busca, na=False) | 
                 df_geral["destino"].astype(str).str.contains(telefone_busca, na=False)
@@ -216,27 +196,16 @@ elif menu == "🔍 Auditoria de Log por Telefone":
                     status_str = str(row["status"])
                     status_cor = "🔴" if "não atendida" in status_str.lower() else "🟢"
                     
-                    # Tratamento seguro para colunas extras
-                    extra1 = row["extra_col1"] if "extra_col1" in df_cliente.columns else ""
-                    extra2 = row["extra_col2"] if "extra_col2" in df_cliente.columns else ""
-                    
-                    # Exibe "Não identificado" caso o ramal esteja vazio
-                    ramal_exibicao = row['ramal_tecnico'] if row['ramal_tecnico'] else "Não identificado / Linha Geral"
-                    
                     st.markdown(f"""
                     * **{status_cor} Data/Hora:** `{row['data_hora']}`  
-                      * **Origem:** `{row['origem']}` | **Destino/Info:** `{row['destino']}`  
-                      * **Ramal Identificado:** `{ramal_exibicao}`  
-                      * **Status:** `{status_str}` | **Tipo:** `{row['tipo']}` | **Duração:** `{row['duracao']}`  
-                      * **Detalhes Extras:** `{extra1} | {extra2}`
+                      * **Origem:** `{row['origem']}` | **Destino:** `{row['destino']}`  
+                      * **Ramal / Técnico:** `{row['ramal_tecnico']}`  
+                      * **Status:** `{status_str}` | **Tipo:** `{row['tipo']}` | **Duração:** `{row['duracao']}`
                     """)
                 
                 st.markdown("---")
                 st.subheader("Tabela Analítica Completa do Número")
-                
-                # Seleciona de forma dinâmica apenas as colunas existentes para evitar erros no Streamlit
-                colunas_disponiveis = [col for col in ["data_hora", "origem", "destino", "ramal_tecnico", "status", "tipo", "duracao", "extra_col1", "extra_col2"] if col in df_cliente.columns]
-                st.dataframe(df_cliente[colunas_disponiveis])
+                st.dataframe(df_cliente[["data_hora", "origem", "destino", "ramal_tecnico", "status", "tipo", "duracao"]])
                 
             else:
                 st.warning(f"Nenhum registro encontrado para o número '{telefone_busca}' no período selecionado.")
