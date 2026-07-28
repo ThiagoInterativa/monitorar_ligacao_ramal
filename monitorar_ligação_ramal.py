@@ -28,7 +28,6 @@ def extrair_tecnico_completo(linha_registro):
 def init_db():
     conn = sqlite3.connect("cdr_nao_atendidas.db")
     cursor = conn.cursor()
-    # Recria a tabela para garantir a nova estrutura flexível
     cursor.execute("DROP TABLE IF EXISTS todas_chamadas")
     cursor.execute("""
         CREATE TABLE todas_chamadas (
@@ -62,7 +61,6 @@ def salvar_no_banco(registros):
                 status = str(reg[5]) if len(reg) > 5 else ""
                 tipo = str(reg[6]) if len(reg) > 6 else "Desconhecido"
 
-                # Extrai o técnico varrendo toda a linha do CDR
                 tecnico_formatado = extrair_tecnico_completo(reg)
                 if not tecnico_formatado:
                     tecnico_formatado = "Fila de Atendimento Geral"
@@ -216,9 +214,3 @@ elif menu == "🔍 Auditoria de Log por Telefone":
                 st.warning(f"Nenhum registro encontrado para '{telefone_busca}'. Verifique se o período das datas abrange esse dia.")
         else:
             st.warning("Sincronize a API primeiro.")
-
----
-
-### O que mudou e como isso ajuda na auditoria?
-* **Varredura Global em Arrays:** O script agora lê todos os campos da linha do CDR de uma só vez. Se o nome do **Gabriel Tomaz** estiver em qualquer canto da linha, ele será capturado imediatamente.
-* **Sem Duplicações Perdidas:** Agora o banco armazena todas as etapas da chamada. Se ela passou pela fila geral e depois foi direcionada para um ramal, ambos os eventos ficam visíveis para cruzamento de auditoria.
