@@ -37,31 +37,30 @@ def salvar_no_banco(registros):
     conn = sqlite3.connect("cdr_nao_atendidas.db")
     cursor = conn.cursor()
     for reg in registros:
-        # reg formato do CDR: [data_hora, origem, destino, ramal, duracao, status, tipo, ...]
         try:
-            data_hora, origem, destino, ramal, duracao, status, tipo = reg[0], reg[1], reg[2], reg[3], reg[4], reg[5], reg[6]
-            
-            # Filtramos apenas as "Não atendidas" para salvar
-            if status.lower() == "não atendida":
-                cursor.execute("""
-                    INSERT OR IGNORE INTO chamadas_perdidas 
-                    (data_hora, origem, destino, ramal_tecnico, duracao, status, tipo)
-                    VALUES (?, ?, ?, ?, ?, ?, ?)
-                """, (data_hora, origem, destino, ramal, duracao, status, tipo))
-        except Exception as e:
+            # Garante que o registro tem o formato esperado
+            if len(reg) >= 7:
+                data_hora, origem, destino, ramal, duracao, status, tipo = reg[0], reg[1], reg[2], reg[3], reg[4], reg[5], reg[6]
+                
+                # Filtramos apenas as "Não atendidas" (case insensitive)
+                if "não atendida" in str(status).lower():
+                    cursor.execute("""
+                        INSERT OR IGNORE INTO chamadas_perdidas 
+                        (data_hora, origem, destino, ramal_tecnico, duracao, status, tipo)
+                        VALUES (?, ?, ?, ?, ?, ?, ?)
+                    """, (data_hora, origem, destino, ramal, duracao, status, tipo))
+        except Exception:
             continue
     conn.commit()
     conn.close()
 
 def carregar_do_banco(data_inicio, data_fim):
     conn = sqlite3.connect("cdr_nao_atendidas.db")
-    # Como a data no banco está no formato DD-MM-YYYY HH:MM:SS, filtramos por data via SQL ou no pandas
     query = "SELECT * FROM chamadas_perdidas"
     df = pd.read_sql_query(query, conn)
     conn.close()
     
     if not df.empty:
-        # Converter coluna de data para datetime para aplicar o filtro de início e fim corretos
         df["data_obj"] = pd.to_datetime(df["data_hora"], format="%d-%m-%Y %H:%M:%S", errors="coerce")
         mask = (df["data_obj"].dt.date >= data_inicio) & (df["data_obj"].dt.date <= data_fim)
         df = df.loc[mask]
@@ -76,6 +75,7 @@ data_fim = st.sidebar.date_input("Data fim")
 if st.button("Sincronizar Dados da API Evence"):
     indice = 0
     total_inseridos = 0
+    sucesso_busca = False
     
     with st.spinner("Buscando registros na API de CDR..."):
         while True:
@@ -83,6 +83,11 @@ if st.button("Sincronizar Dados da API Evence"):
             
             try:
                 response = requests.get(url)
+                
+                # Se der 404, geralmente indica que a paginação acabou ou a rota chegou ao fim
+                if response.status_code == 404:
+                    break
+                
                 if response.status_code != 200:
                     st.error(f"Erro na API: Status {response.status_code}")
                     break
@@ -95,16 +100,16 @@ if st.button("Sincronizar Dados da API Evence"):
                 
                 cdr_dict = data.get("cdr", {})
                 if not cdr_dict:
-                    break # Acabaram os registros
+                    break # Fim dos registros
                 
-                # Converte o dicionário retornado em lista para salvar
                 lista_registros = list(cdr_dict.values())
                 salvar_no_banco(lista_registros)
                 
                 total_inseridos += len(lista_registros)
-                indice += len(lista_registros) # Avança o índice para paginação
+                indice += len(lista_registros) 
+                sucesso_busca = True
                 
-                # Se veio menos que o lote esperado ou dicionário vazio, encerra
+                # Segurança contra loop infinito caso a API retorne sempre a mesma quantidade
                 if len(lista_registros) == 0:
                     break
                     
@@ -112,7 +117,10 @@ if st.button("Sincronizar Dados da API Evence"):
                 st.error(f"Erro de conexão: {e}")
                 break
                 
-    st.success(f"Sincronização concluída! Dados processados com sucesso.")
+    if sucesso_busca or total_inseridos > 0:
+        st.success(f"Sincronização concluída! {total_inseridos} registros analisados e salvos.")
+    else:
+        st.warning("A sincronização finalizou, mas nenhum registro foi retornado pela API para este período.")
 
 # ===== EXIBIÇÃO DOS DADOS DO BANCO =====
 df_resultado = carregar_do_banco(data_inicio, data_fim)
@@ -120,16 +128,13 @@ df_resultado = carregar_do_banco(data_inicio, data_fim)
 if not df_resultado.empty:
     st.subheader(f"Chamadas Não Atendidas por Ramal/Técnico ({data_inicio} a {data_fim})")
     
-    # Agrupa por ramal/técnico
     contagem = df_resultado["ramal_tecnico"].value_counts().reset_index()
     contagem.columns = ["Ramal / Técnico", "Quantidade Não Atendida"]
 
-    # Cards métricas
     cols = st.columns(4)
     for i, row in contagem.iterrows():
         cols[i % 4].metric(f"Ramal {row['Ramal / Técnico']}", int(row['Quantidade Não Atendida']))
 
-    # Gráfico
     fig = px.pie(
         contagem,
         names="Ramal / Técnico",
@@ -138,11 +143,9 @@ if not df_resultado.empty:
     )
     st.plotly_chart(fig, use_container_width=True)
 
-    # Tabela detalhada
     st.subheader("Detalhamento das Chamadas Perdidas")
     st.dataframe(df_resultado[["data_hora", "origem", "destino", "ramal_tecnico", "status", "tipo"]])
 
-    # ===== EXPORTAÇÃO =====
     st.markdown("---")
     col_exp1, col_exp2 = st.columns(2)
 
@@ -160,4 +163,4 @@ if not df_resultado.empty:
         )
 
 else:
-    st.info("Nenhum registro de chamada não atendida encontrado para este período no banco local. Clique em 'Sincronizar Dados da API Evence'.")
+    st.info("Nenhum registro de chamada não atendida encontrado para este período no banco local. Selecione um período onde houve chamadas e clique em 'Sincronizar Dados da API Evence'.")
