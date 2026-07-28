@@ -192,18 +192,23 @@ elif menu == "🔍 Auditoria de Log por Telefone":
                 # Ordena cronologicamente
                 df_cliente = df_cliente.sort_values(by="data_obj", ascending=True)
                 
-                st.markdown("### 🕒 Linha do Tempo Completa da Chamada")
+               st.markdown("### 🕒 Linha do Tempo Completa da Chamada")
                 for idx, row in df_cliente.iterrows():
                     status_str = str(row["status"])
                     status_cor = "🔴" if "não atendida" in status_str.lower() else "🟢"
+                    
+                    # Verificação segura para evitar KeyError caso o banco seja antigo
+                    extra1 = row.get("extra_col1", "")
+                    extra2 = row.get("extra_col2", "")
                     
                     st.markdown(f"""
                     * **{status_cor} Data/Hora:** `{row['data_hora']}`  
                       * **Origem:** `{row['origem']}` | **Destino/Info:** `{row['destino']}`  
                       * **Ramal Identificado:** `Ramal {row['ramal_tecnico']}`  
                       * **Status:** `{status_str}` | **Tipo:** `{row['tipo']}` | **Duração:** `{row['duracao']}`  
-                      * **Detalhes Extras:** `{row['extra_col1']} | {row['extra_col2']}`
+                      * **Detalhes Extras:** `{extra1} | {extra2}`
                     """)
+                    
                 
                 st.markdown("---")
                 st.subheader("Tabela Analítica Completa do Número")
