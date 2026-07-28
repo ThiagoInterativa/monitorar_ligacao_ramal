@@ -198,13 +198,13 @@ if not df_resultado.empty:
     with col_exp2:
         from fpdf import FPDF
 
-        def gerar_pdf(df):
+    def gerar_pdf(df):
             pdf = FPDF()
             pdf.add_page()
             pdf.set_font("Arial", "B", 16)
             pdf.cell(200, 10, txt="Relatorio de Recusas por Tecnico", ln=True, align="C")
             pdf.set_font("Arial", "", 12)
-            pdf.cell(200, 10, txt= desempenho no periodo indicado, ln=True, align="C")
+            pdf.cell(200, 10, txt="Desempenho no periodo indicado", ln=True, align="C") # <-- Adicionadas as aspas aqui
             pdf.ln(10)
             
             # Cabeçalho da tabela
@@ -219,7 +219,7 @@ if not df_resultado.empty:
                 pdf.cell(60, 10, str(int(row["total"])), 1, ln=True)
                 
             return pdf.output()
-
+        
         try:
             pdf_bytes = bytes(gerar_pdf(df_resultado))
             st.download_button(
