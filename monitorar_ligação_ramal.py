@@ -13,12 +13,19 @@ st.title("📊 Monitoramento e Auditoria Avançada de Chamadas (API CDR Evence)"
 API_TOKEN = "4275c3fd79ac7997e3dc03fb451657518b50d55203c41c8798a3c81eb5825031"
 BASE_URL = "https://pabx.evence.com.br/api/v1/cdr"
 
-def extrair_tecnico_completo(linha_registro):
+def extrair_tecnico_forca_bruta(item_bruto):
     """
-    Varre todos os campos de um registro bruto da API em busca do padrão 'Nome <ramal>'.
+    Varre qualquer estrutura (lista, dicionário ou string) em busca do padrão Asterisk: Nome <ramal>
     """
-    texto_concatenado = " ".join([str(item) for item in linha_registro])
-    match = re.search(r'"?([^"<]+)"?\s*<(\d+)>', texto_concatenado)
+    if isinstance(item_bruto, (list, tuple)):
+        texto_unificado = " ".join([str(x) for x in item_bruto])
+    elif isinstance(item_bruto, dict):
+        texto_unificado = " ".join([str(v) for v in item_bruto.values()])
+    else:
+        texto_unificado = str(item_bruto)
+
+    # Procura por padrões como "Gabriel Tomaz < 108 >" ou 'Gabriel Tomaz' <108>
+    match = re.search(r'"?([^"<]+)"?\s*<\s*(\d+)\s*>', texto_unificado)
     if match:
         nome = match.group(1).strip().replace('"', '')
         ramal = match.group(2).strip()
@@ -50,9 +57,19 @@ init_db()
 def salvar_no_banco(registros):
     conn = sqlite3.connect("cdr_nao_atendidas.db")
     cursor = conn.cursor()
-    for reg in registros:
+    
+    # Se a API retornar um dicionário ou lista de registros
+    if isinstance(registros, dict):
+        itens = registros.values()
+    else:
+        itens = registros
+
+    for reg in itens:
         try:
-            if len(reg) >= 6:
+            # Garante que conseguimos extrair o técnico de qualquer formato que a API mande (lista ou string)
+            tecnico_encontrado = extrair_tecnico_forca_bruta(reg)
+            
+            if isinstance(reg, (list, tuple)) and len(reg) >= 6:
                 data_hora = str(reg[0]) if len(reg) > 0 else ""
                 origem = str(reg[1]) if len(reg) > 1 else ""
                 destino = str(reg[2]) if len(reg) > 2 else ""
@@ -60,18 +77,27 @@ def salvar_no_banco(registros):
                 duracao = str(reg[4]) if len(reg) > 4 else ""
                 status = str(reg[5]) if len(reg) > 5 else ""
                 tipo = str(reg[6]) if len(reg) > 6 else "Desconhecido"
+            else:
+                # Fallback caso venha em formato de texto bruto ou dicionário alternativo
+                data_hora = ""
+                origem = str(reg)
+                destino = ""
+                canal_ramal = ""
+                duracao = ""
+                status = ""
+                tipo = "Desconhecido"
 
-                tecnico_formatado = extrair_tecnico_completo(reg)
-                if not tecnico_formatado:
-                    tecnico_formatado = "Fila de Atendimento Geral"
+            if not tecnico_encontrado:
+                tecnico_encontrado = "Fila de Atendimento Geral"
 
-                cursor.execute("""
-                    INSERT INTO todas_chamadas 
-                    (data_hora, origem, destino, canal_ramal, duracao, status, tipo, tecnico_formatado)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                """, (data_hora, origem, destino, canal_ramal, duracao, status, tipo, tecnico_formatado))
+            cursor.execute("""
+                INSERT INTO todas_chamadas 
+                (data_hora, origem, destino, canal_ramal, duracao, status, tipo, tecnico_formatado)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """, (data_hora, origem, destino, canal_ramal, duracao, status, tipo, tecnico_encontrado))
         except Exception:
             continue
+            
     conn.commit()
     conn.close()
 
@@ -116,14 +142,14 @@ if st.sidebar.button("Sincronizar Dados da API Evence"):
                 if not cdr_dict:
                     break 
                 
-                lista_registros = list(cdr_dict.values())
-                salvar_no_banco(lista_registros)
+                salvar_no_banco(cdr_dict)
                 
-                total_inseridos += len(lista_registros)
-                indice += len(lista_registros) 
+                qtd = len(cdr_dict)
+                total_inseridos += qtd
+                indice += qtd 
                 sucesso_busca = True
                 
-                if len(lista_registros) == 0:
+                if qtd == 0:
                     break
             except Exception:
                 break
