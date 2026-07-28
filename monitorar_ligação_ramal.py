@@ -6,6 +6,7 @@ import pandas as pd
 import io
 import re
 
+# Configuração inicial da página do Streamlit para modo wide (largura total)
 st.set_page_config(layout="wide")
 st.title("📊 Monitoramento e Auditoria Avançada de Chamadas (API CDR Evence)")
 
@@ -14,9 +15,12 @@ API_TOKEN = "4275c3fd79ac7997e3dc03fb451657518b50d55203c41c8798a3c81eb5825031"
 BASE_URL = "https://pabx.evence.com.br/api/v1/cdr"
 
 def init_db():
+    """
+    Inicializa o banco de dados SQLite local e cria a tabela 'todas_chamadas' 
+    caso ela ainda não exista, garantindo a persistência dos dados.
+    """
     conn = sqlite3.connect("cdr_nao_atendidas.db")
     cursor = conn.cursor()
-    # Criamos uma tabela flexível para armazenar todas as posições do array do CDR
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS todas_chamadas (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -35,9 +39,14 @@ def init_db():
     conn.commit()
     conn.close()
 
+# Executa a criação do banco de dados na inicialização
 init_db()
 
 def salvar_no_banco(registros):
+    """
+    Recebe os registros brutos da API, limpa os dados, extrai o número do ramal 
+    usando Regex (ex: extraindo de 'Nome < 108 >') e salva no banco de dados local.
+    """
     conn = sqlite3.connect("cdr_nao_atendidas.db")
     cursor = conn.cursor()
     for reg in registros:
@@ -53,30 +62,36 @@ def salvar_no_banco(registros):
                 extra1 = str(reg[7]) if len(reg) > 7 else ""
                 extra2 = str(reg[8]) if len(reg) > 8 else ""
                 
-                # Tenta extrair número de ramal caso venha formatado como "Nome < 108 >"
+                # Tenta extrair o número exato do ramal caso venha formatado (ex: "Nome < 108 >")
                 match_ramal = re.search(r'<\s*(\d+)\s*>', destino + " " + ramal + " " + extra1)
                 if match_ramal:
                     ramal_limpo = match_ramal.group(1)
                 else:
                     ramal_limpo = ramal
 
+                # Insere no banco evitando duplicatas através da restrição UNIQUE
                 cursor.execute("""
                     INSERT OR IGNORE INTO todas_chamadas 
                     (data_hora, origem, destino, ramal_tecnico, duracao, status, tipo, extra_col1, extra_col2)
                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """, (data_hora, origem, destino, ramal_limpo, duracao, status, tipo, extra1, extra2))
-        except Exception as e:
+        except Exception:
             continue
     conn.commit()
     conn.close()
 
 def carregar_do_banco(data_inicio, data_fim):
+    """
+    Carrega todos os dados salvos no banco local e aplica o filtro 
+    de período com base nas datas selecionadas na barra lateral.
+    """
     conn = sqlite3.connect("cdr_nao_atendidas.db")
     query = "SELECT * FROM todas_chamadas"
     df = pd.read_sql_query(query, conn)
     conn.close()
     
     if not df.empty:
+        # Converte a coluna de data/hora de texto para o formato datetime do Pandas
         df["data_obj"] = pd.to_datetime(df["data_hora"], format="%d-%m-%Y %H:%M:%S", errors="coerce")
         mask = (df["data_obj"].dt.date >= data_inicio) & (df["data_obj"].dt.date <= data_fim)
         df = df.loc[mask]
@@ -89,7 +104,7 @@ menu = st.sidebar.radio("Escolha a Opção", ["Dashboard Geral", "🔍 Auditoria
 data_inicio = st.sidebar.date_input("Data início")
 data_fim = st.sidebar.date_input("Data fim")
 
-# Botão de Sincronização Global
+# Botão de Sincronização Global com a API da Evence
 if st.sidebar.button("Sincronizar Dados da API Evence"):
     indice = 0
     total_inseridos = 0
@@ -101,6 +116,7 @@ if st.sidebar.button("Sincronizar Dados da API Evence"):
             
             try:
                 response = requests.get(url)
+                # Se retornar 404, significa que a paginação chegou ao fim
                 if response.status_code == 404:
                     break
                 if response.status_code != 200:
@@ -134,7 +150,7 @@ if st.sidebar.button("Sincronizar Dados da API Evence"):
     else:
         st.sidebar.warning("Nenhum registro retornado pela API para este período.")
 
-# Carrega a base geral do período
+# Carrega a base geral filtrada por período do banco local
 df_geral = carregar_do_banco(data_inicio, data_fim)
 
 # ==========================================
@@ -144,16 +160,20 @@ if menu == "Dashboard Geral":
     st.subheader(f"📊 Painel de Chamadas Não Atendidas ({data_inicio} a {data_fim})")
     
     if not df_geral.empty:
+        # Filtra apenas as chamadas que possuem status de "não atendida"
         df_nao_atendidas = df_geral[df_geral["status"].str.lower().str.contains("não atendida", na=False)]
         
         if not df_nao_atendidas.empty:
+            # Agrupa e conta a quantidade de chamadas perdidas por ramal/técnico
             contagem = df_nao_atendidas["ramal_tecnico"].value_counts().reset_index()
             contagem.columns = ["Ramal / Técnico", "Quantidade Não Atendida"]
 
+            # Exibe em cards de métrica
             cols = st.columns(4)
             for i, row in contagem.iterrows():
                 cols[i % 4].metric(f"Ramal {row['Ramal / Técnico']}", int(row['Quantidade Não Atendida']))
 
+            # Gera gráfico de pizza proporcional
             fig = px.pie(
                 contagem,
                 names="Ramal / Técnico",
@@ -180,7 +200,7 @@ elif menu == "🔍 Auditoria de Log por Telefone":
     
     if telefone_busca:
         if not df_geral.empty:
-            # Filtra o dataframe geral pelo número de origem ou destino contendo o texto digitado
+            # Filtra o dataframe cruzando a origem (cliente) ou o destino
             df_cliente = df_geral[
                 df_geral["origem"].astype(str).str.contains(telefone_busca, na=False) | 
                 df_geral["destino"].astype(str).str.contains(telefone_busca, na=False)
@@ -189,15 +209,15 @@ elif menu == "🔍 Auditoria de Log por Telefone":
             if not df_cliente.empty:
                 st.success(f"Encontrados {len(df_cliente)} registros de movimentação para o número: **{telefone_busca}**")
                 
-                # Ordena cronologicamente
+                # Ordena os eventos cronologicamente para montar a linha do tempo
                 df_cliente = df_cliente.sort_values(by="data_obj", ascending=True)
                 
-               st.markdown("### 🕒 Linha do Tempo Completa da Chamada")
+                st.markdown("### 🕒 Linha do Tempo Completa da Chamada")
                 for idx, row in df_cliente.iterrows():
                     status_str = str(row["status"])
                     status_cor = "🔴" if "não atendida" in status_str.lower() else "🟢"
                     
-                    # Verificação segura para evitar KeyError caso o banco seja antigo
+                    # Uso do .get() para evitar erros caso colunas extras não existam no banco antigo
                     extra1 = row.get("extra_col1", "")
                     extra2 = row.get("extra_col2", "")
                     
@@ -208,7 +228,6 @@ elif menu == "🔍 Auditoria de Log por Telefone":
                       * **Status:** `{status_str}` | **Tipo:** `{row['tipo']}` | **Duração:** `{row['duracao']}`  
                       * **Detalhes Extras:** `{extra1} | {extra2}`
                     """)
-                    
                 
                 st.markdown("---")
                 st.subheader("Tabela Analítica Completa do Número")
