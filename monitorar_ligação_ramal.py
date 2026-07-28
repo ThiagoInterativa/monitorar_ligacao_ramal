@@ -1,27 +1,31 @@
 import streamlit as st
 import requests
 import plotly.express as px
-from bs4 import BeautifulSoup
-from collections import Counter
 import sqlite3
 import pandas as pd
 import io
 
 st.set_page_config(layout="wide")
-st.title("📊 Relatório de Recusas por Técnico - Monitoramento Persistente")
+st.title("📊 Monitoramento de Chamadas Não Atendidas (API CDR Evence)")
 
-# ===== CONFIGURAÇÃO DO BANCO DE DADOS LOCAL (SQLite) =====
+# ===== CONFIGURAÇÃO DA API E BANCO =====
+API_TOKEN = "4275c3fd79ac7997e3dc03fb451657518b50d55203c41c8798a3c81eb5825031"
+BASE_URL = "https://pabx.evence.com.br/api/v1/cdr"
+
 def init_db():
-    conn = sqlite3.connect("recusas_tecnicos.db")
+    conn = sqlite3.connect("cdr_nao_atendidas.db")
     cursor = conn.cursor()
     cursor.execute("""
-        CREATE TABLE IF NOT EXISTS historico_recusas (
+        CREATE TABLE IF NOT EXISTS chamadas_perdidas (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
-            data_busca TEXT,
-            fila_id TEXT,
-            tecnico TEXT,
-            quantidade INTEGER,
-            UNIQUE(data_busca, fila_id, tecnico)
+            data_hora TEXT,
+            origem TEXT,
+            destino TEXT,
+            ramal_tecnico TEXT,
+            duracao TEXT,
+            status TEXT,
+            tipo TEXT,
+            UNIQUE(data_hora, origem, destino, ramal_tecnico)
         )
     """)
     conn.commit()
@@ -29,207 +33,131 @@ def init_db():
 
 init_db()
 
-def salvar_no_banco(data_busca, fila_id, contagem):
-    conn = sqlite3.connect("recusas_tecnicos.db")
+def salvar_no_banco(registros):
+    conn = sqlite3.connect("cdr_nao_atendidas.db")
     cursor = conn.cursor()
-    for tecnico, qtd in contagem.items():
-        cursor.execute("""
-            INSERT INTO historico_recusas (data_busca, fila_id, tecnico, quantidade)
-            VALUES (?, ?, ?, ?)
-            ON CONFLICT(data_busca, fila_id, tecnico) 
-            DO UPDATE SET quantidade = excluded.quantidade
-        """, (data_busca, fila_id, tecnico, qtd))
+    for reg in registros:
+        # reg formato do CDR: [data_hora, origem, destino, ramal, duracao, status, tipo, ...]
+        try:
+            data_hora, origem, destino, ramal, duracao, status, tipo = reg[0], reg[1], reg[2], reg[3], reg[4], reg[5], reg[6]
+            
+            # Filtramos apenas as "Não atendidas" para salvar
+            if status.lower() == "não atendida":
+                cursor.execute("""
+                    INSERT OR IGNORE INTO chamadas_perdidas 
+                    (data_hora, origem, destino, ramal_tecnico, duracao, status, tipo)
+                    VALUES (?, ?, ?, ?, ?, ?, ?)
+                """, (data_hora, origem, destino, ramal, duracao, status, tipo))
+        except Exception as e:
+            continue
     conn.commit()
     conn.close()
 
-def carregar_do_banco(fila_id, data_inicio, data_fim):
-    conn = sqlite3.connect("recusas_tecnicos.db")
-    query = """
-        SELECT tecnico, SUM(quantidade) as total 
-        FROM historico_recusas 
-        WHERE fila_id = ? AND data_busca BETWEEN ? AND ?
-        GROUP BY tecnico
-    """
-    df = pd.read_sql_query(query, conn, params=(fila_id, str(data_inicio), str(data_fim)))
+def carregar_do_banco(data_inicio, data_fim):
+    conn = sqlite3.connect("cdr_nao_atendidas.db")
+    # Como a data no banco está no formato DD-MM-YYYY HH:MM:SS, filtramos por data via SQL ou no pandas
+    query = "SELECT * FROM chamadas_perdidas"
+    df = pd.read_sql_query(query, conn)
     conn.close()
+    
+    if not df.empty:
+        # Converter coluna de data para datetime para aplicar o filtro de início e fim corretos
+        df["data_obj"] = pd.to_datetime(df["data_hora"], format="%d-%m-%Y %H:%M:%S", errors="coerce")
+        mask = (df["data_obj"].dt.date >= data_inicio) & (df["data_obj"].dt.date <= data_fim)
+        df = df.loc[mask]
     return df
 
-# ===== CONFIG LOGIN =====
-login_url = "https://pabx.evence.com.br/login"
-email = "suporte@interativanet.com.br"
-senha = "smk03657"
-
-# ===== FUNÇÃO LOGIN =====
-def login_pabx():
-    session = requests.Session()
-    session.headers.update({"User-Agent": "Mozilla/5.0"})
-    try:
-        r = session.get(login_url)
-        soup = BeautifulSoup(r.text, "html.parser")
-        csrf = soup.find("input", {"name": "_token"})
-        if not csrf:
-            st.error("Erro ao pegar token CSRF")
-            return None
-
-        payload = {"login": email, "senha": senha, "_token": csrf["value"]}
-        response = session.post(login_url, data=payload)
-
-        if response.url == login_url:
-            st.error("Login falhou")
-            return None
-        return session
-    except Exception as e:
-        st.error(f"Erro no login: {e}")
-        return None
-
-# ===== CRIA SESSÃO =====
-if "session_pabx" not in st.session_state:
-    st.session_state.session_pabx = login_pabx()
-
 # ===== FILTROS NA TELA =====
-st.sidebar.header("Filtros")
-fila_id = st.sidebar.text_input("Fila ID", "2812")
+st.sidebar.header("Filtros de Período")
 data_inicio = st.sidebar.date_input("Data início")
 data_fim = st.sidebar.date_input("Data fim")
 
-# ===== BOTÃO BUSCAR =====
-if st.button("Buscar Dados da Evence e Atualizar"):
-    session = st.session_state.session_pabx
-    if not session:
-        st.error("Sessão inválida")
-        st.stop()
-
-    d_ini_str = str(data_inicio)
-    d_fim_str = str(data_fim)
-    url = f"https://pabx.evence.com.br/callcenter/relatorios/recusa-pa?fila_id={fila_id}&data_inicial={d_ini_str}&data_final={d_fim_str}"
-
-    response = session.get(url)
-    if "login" in response.url:
-        session = login_pabx()
-        st.session_state.session_pabx = session
-        response = session.get(url)
-
-    if response.status_code != 200:
-        st.error("Erro ao acessar relatório")
-        st.stop()
-
-    soup = BeautifulSoup(response.text, "html.parser")
-    tecnicos = []
-
-    # Paginação
-    ultima_pagina = 1
-    paginacao = soup.find("ul", class_="pagination")
-    if paginacao:
-        paginas = paginacao.find_all("a")
-        numeros = []
-        for p in paginas:
-            try:
-                numeros.append(int(p.text.strip()))
-            except:
-                pass
-        if numeros:
-            ultima_pagina = max(numeros)
-
-    # Loop de páginas
-    for page in range(1, ultima_pagina + 1):
-        url_pagina = f"{url}&page={page}"
-        response = session.get(url_pagina)
-        soup = BeautifulSoup(response.text, "html.parser")
-        tabela = soup.find("table")
-        if not tabela:
-            continue
-        linhas = tabela.find("tbody").find_all("tr")
-        for linha in linhas:
-            colunas = linha.find_all("td")
-            if len(colunas) >= 3:
-                tecnico = colunas[2].text.strip()
-                tecnicos.append(tecnico)
-
-    contagem = dict(Counter(tecnicos))
+# ===== BOTÃO BUSCAR DA API =====
+if st.button("Sincronizar Dados da API Evence"):
+    indice = 0
+    total_inseridos = 0
     
-    # Salva no banco de dados local por data de busca para manter histórico
-    if contagem:
-        salvar_no_banco(str(data_inicio), fila_id, contagem)
-        st.success("Dados buscados e salvos com sucesso no banco de dados local!")
-    else:
-        st.warning("Nenhum registro encontrado para o período.")
+    with st.spinner("Buscando registros na API de CDR..."):
+        while True:
+            url = f"{BASE_URL}?api_token={API_TOKEN}&datainicio={data_inicio}&datafinal={data_fim}&indice={indice}"
+            
+            try:
+                response = requests.get(url)
+                if response.status_code != 200:
+                    st.error(f"Erro na API: Status {response.status_code}")
+                    break
+                
+                data = response.json()
+                
+                if "error" in data:
+                    st.error(f"Erro retornado pela API: {data['error']}")
+                    break
+                
+                cdr_dict = data.get("cdr", {})
+                if not cdr_dict:
+                    break # Acabaram os registros
+                
+                # Converte o dicionário retornado em lista para salvar
+                lista_registros = list(cdr_dict.values())
+                salvar_no_banco(lista_registros)
+                
+                total_inseridos += len(lista_registros)
+                indice += len(lista_registros) # Avança o índice para paginação
+                
+                # Se veio menos que o lote esperado ou dicionário vazio, encerra
+                if len(lista_registros) == 0:
+                    break
+                    
+            except Exception as e:
+                st.error(f"Erro de conexão: {e}")
+                break
+                
+    st.success(f"Sincronização concluída! Dados processados com sucesso.")
 
-# ===== EXIBIÇÃO DOS DADOS SALVOS (Persistidos) =====
-df_resultado = carregar_do_banco(fila_id, data_inicio, data_fim)
+# ===== EXIBIÇÃO DOS DADOS DO BANCO =====
+df_resultado = carregar_do_banco(data_inicio, data_fim)
 
 if not df_resultado.empty:
-    st.subheader(f"Resumo por Técnico (Período: {data_inicio} a {data_fim})")
+    st.subheader(f"Chamadas Não Atendidas por Ramal/Técnico ({data_inicio} a {data_fim})")
+    
+    # Agrupa por ramal/técnico
+    contagem = df_resultado["ramal_tecnico"].value_counts().reset_index()
+    contagem.columns = ["Ramal / Técnico", "Quantidade Não Atendida"]
 
     # Cards métricas
     cols = st.columns(4)
-    for i, row in df_resultado.iterrows():
-        cols[i % 4].metric(row["tecnico"], int(row["total"]))
+    for i, row in contagem.iterrows():
+        cols[i % 4].metric(f"Ramal {row['Ramal / Técnico']}", int(row['Quantidade Não Atendida']))
 
     # Gráfico
     fig = px.pie(
-        df_resultado,
-        names="tecnico",
-        values="total",
-        title="Proporção de Recusas"
+        contagem,
+        names="Ramal / Técnico",
+        values="Quantidade Não Atendida",
+        title="Proporção de Chamadas Não Atendidas por Ramal"
     )
     st.plotly_chart(fig, use_container_width=True)
 
-    # ===== BOTÕES DE EXPORTAÇÃO =====
+    # Tabela detalhada
+    st.subheader("Detalhamento das Chamadas Perdidas")
+    st.dataframe(df_resultado[["data_hora", "origem", "destino", "ramal_tecnico", "status", "tipo"]])
+
+    # ===== EXPORTAÇÃO =====
     st.markdown("---")
-    st.subheader("Exportar Relatórios")
-    
     col_exp1, col_exp2 = st.columns(2)
 
-    # 1. Exportar para Excel (XLSX)
     with col_exp1:
         output = io.BytesIO()
         with pd.ExcelWriter(output, engine='openpyxl') as writer:
-            df_resultado.to_excel(writer, index=False, sheet_name='Recusas')
+            df_resultado.to_excel(writer, index=False, sheet_name='Nao Atendidas')
         excel_data = output.getvalue()
         
         st.download_button(
             label="📥 Baixar Relatório em Excel (XLSX)",
             data=excel_data,
-            file_name=f"relatorio_recusas_{data_inicio}_a_{data_fim}.xlsx",
+            file_name=f"nao_atendidas_{data_inicio}_a_{data_fim}.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
         )
 
-    # 2. Exportar para PDF Simples (via FPDF2)
-    # 2. Exportar para PDF Simples (via FPDF2)
-    with col_exp2:
-        from fpdf import FPDF
-
-        def gerar_pdf(df):
-            pdf = FPDF()
-            pdf.add_page()
-            pdf.set_font("Arial", "B", 16)
-            pdf.cell(200, 10, txt="Relatorio de Recusas por Tecnico", ln=True, align="C")
-            pdf.set_font("Arial", "", 12)
-            pdf.cell(200, 10, txt="Desempenho no periodo indicado", ln=True, align="C")
-            pdf.ln(10)
-            
-            # Cabeçalho da tabela
-            pdf.set_font("Arial", "B", 12)
-            pdf.cell(130, 10, "Tecnico", 1)
-            pdf.cell(60, 10, "Quantidade", 1, ln=True)
-            
-            # Linhas
-            pdf.set_font("Arial", "", 12)
-            for _, row in df.iterrows():
-                pdf.cell(130, 10, str(row["tecnico"]), 1)
-                pdf.cell(60, 10, str(int(row["total"])), 1, ln=True)
-                
-            return pdf.output()
-
-        try:
-            pdf_bytes = bytes(gerar_pdf(df_resultado))
-            st.download_button(
-                label="📥 Baixar Relatório em PDF",
-                data=pdf_bytes,
-                file_name=f"relatorio_recusas_{data_inicio}_a_{data_fim}.pdf",
-                mime="application/pdf"
-            )
-        except Exception as e:
-            st.info(f"Erro ao gerar PDF: {e}")
 else:
-    st.info("Nenhum dado encontrado no banco de dados local para este filtro. Clique em 'Buscar Dados' para carregar da Evence.")
+    st.info("Nenhum registro de chamada não atendida encontrado para este período no banco local. Clique em 'Sincronizar Dados da API Evence'.")
