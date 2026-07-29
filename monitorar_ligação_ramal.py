@@ -1,24 +1,24 @@
 """
-Auditoria PABX Evence
-======================
-Faz login no painel (sessão + CSRF), consulta os relatórios:
+Auditoria PABX Evence (Versão Otimizada e Corrigida)
+===================================================
+Faz login no painel via requests (sessão + CSRF), consulta os relatórios:
   - CDR sintético (/cdr/pesquisar)         -> filtra por telefone/data
-  - Recusas na P.A. (/callcenter/relatorios/recusa-pa) -> filtra por fila/data
-Salva tudo em SQLite local (pabx_audit.db) para permitir:
-  - busca de auditoria por telefone (histórico completo do número)
-  - fechamento mensal por técnico (taxa de recusa/abandono, tempo médio)
+  - Recusas na P.A. (/callcenter/relatorios/recusa-pa) -> coleta o período e faz o filtro local pelo Bina (telefone do cliente)
+Salva tudo em SQLite local (pabx_audit.db) garantindo deduplicação estrita por Call ID / Chave composta.
 
-CONFIGURAÇÃO DE CREDENCIAIS (não coloque senha no código!):
+CONFIGURAÇÃO DE CREDENCIAIS:
   Crie um arquivo .streamlit/secrets.toml com:
     [pabx]
     login = "seu_usuario"
     senha = "sua_senha"
-  Ou defina as variáveis de ambiente PABX_LOGIN e PABX_SENHA.
+    api_token = "seu_token" (opcional para conferência via API)
+  Ou defina variáveis de ambiente PABX_LOGIN, PABX_SENHA e PABX_API_TOKEN.
 """
 
 import os
 import sqlite3
 import unicodedata
+import re
 from datetime import date, datetime
 
 import pandas as pd
@@ -28,7 +28,7 @@ import streamlit as st
 from bs4 import BeautifulSoup
 
 st.set_page_config(layout="wide")
-st.title("📊 Auditoria de Chamadas - PABX")
+st.title("📊 Auditoria de Chamadas - PABX Evence")
 
 BASE_URL = "https://pabx.evence.com.br"
 LOGIN_URL = f"{BASE_URL}/login"
@@ -38,7 +38,7 @@ DB_PATH = os.path.join(os.path.dirname(__file__), "pabx_audit.db")
 
 
 # ============================================================
-# CREDENCIAIS (nunca hardcode - use secrets.toml ou env vars)
+# 1. CREDENCIAIS
 # ============================================================
 def get_credentials():
     try:
@@ -49,15 +49,26 @@ def get_credentials():
         return login, senha
 
 
+def get_api_token():
+    try:
+        return st.secrets["pabx"]["api_token"]
+    except Exception:
+        return os.environ.get("PABX_API_TOKEN", "")
+
+
 # ============================================================
-# BANCO DE DADOS
+# 2. BANCO DE DADOS (Com UNIQUE restrito para evitar duplicidade)
 # ============================================================
-def init_db():
+def init_db(reset=False):
     conn = sqlite3.connect(DB_PATH)
+    if reset:
+        conn.execute("DROP TABLE IF EXISTS chamadas")
+    
     conn.execute("""
         CREATE TABLE IF NOT EXISTS chamadas (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
-            origem_relatorio TEXT,      -- 'cdr' ou 'recusa_pa'
+            origem_relatorio TEXT,       -- 'cdr' ou 'recusa_pa'
+            call_id TEXT,                -- Identificador único fornecido pelo PABX
             data_hora TEXT,
             numero_origem TEXT,
             numero_destino TEXT,
@@ -69,7 +80,7 @@ def init_db():
             fila_id TEXT,
             raw_linha TEXT,
             coletado_em TEXT,
-            UNIQUE(origem_relatorio, data_hora, numero_origem, numero_destino, ramal_destino)
+            UNIQUE(call_id, origem_relatorio)
         )
     """)
     conn.commit()
@@ -77,33 +88,41 @@ def init_db():
 
 
 def salvar_linhas(conn, linhas):
-    """linhas: lista de dicts com as chaves da tabela"""
+    """Insere registros evitando duplicatas via constraint UNIQUE(call_id, origem_relatorio)."""
     cur = conn.cursor()
+    inseridos = 0
     for linha in linhas:
-        cur.execute("""
-            INSERT OR IGNORE INTO chamadas
-            (origem_relatorio, data_hora, numero_origem, numero_destino,
-             ramal_origem, ramal_destino, tecnico, status, duracao, fila_id,
-             raw_linha, coletado_em)
-            VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
-        """, (
-            linha.get("origem_relatorio"), linha.get("data_hora"),
-            linha.get("numero_origem"), linha.get("numero_destino"),
-            linha.get("ramal_origem"), linha.get("ramal_destino"),
-            linha.get("tecnico"), linha.get("status"), linha.get("duracao"),
-            linha.get("fila_id"), str(linha.get("raw_linha")),
-            datetime.now().isoformat()
-        ))
+        c_id = linha.get("call_id") or f"gen_{linha.get('origem_relatorio')}_{linha.get('data_hora')}_{linha.get('numero_origem')}_{linha.get('ramal_destino')}"
+        try:
+            cur.execute("""
+                INSERT OR IGNORE INTO chamadas
+                (origem_relatorio, call_id, data_hora, numero_origem, numero_destino,
+                 ramal_origem, ramal_destino, tecnico, status, duracao, fila_id,
+                 raw_linha, coletado_em)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)
+            """, (
+                linha.get("origem_relatorio"), c_id, linha.get("data_hora"),
+                linha.get("numero_origem"), linha.get("numero_destino"),
+                linha.get("ramal_origem"), linha.get("ramal_destino"),
+                linha.get("tecnico"), linha.get("status"), linha.get("duracao"),
+                linha.get("fila_id"), str(linha.get("raw_linha")),
+                datetime.now().isoformat()
+            ))
+            if cur.rowcount > 0:
+                inseridos += 1
+        except Exception as e:
+            print(f"Erro ao salvar linha: {e}")
     conn.commit()
+    return inseridos
 
 
 # ============================================================
-# LOGIN / SESSÃO
+# 3. AUTENTICAÇÃO E SESSÃO PABX
 # ============================================================
 def login_pabx():
     login, senha = get_credentials()
     if not login or not senha:
-        st.error("Credenciais não configuradas. Preencha secrets.toml ou variáveis de ambiente PABX_LOGIN/PABX_SENHA.")
+        st.error("Credenciais não configuradas. Preencha secrets.toml ou variáveis de ambiente.")
         return None
 
     session = requests.Session()
@@ -114,14 +133,14 @@ def login_pabx():
         soup = BeautifulSoup(r.text, "html.parser")
         csrf = soup.find("input", {"name": "_token"})
         if not csrf:
-            st.error("Não encontrei o token CSRF na página de login. O layout pode ter mudado.")
+            st.error("Token CSRF não encontrado na página de login.")
             return None
 
         payload = {"login": login, "senha": senha, "_token": csrf["value"]}
         response = session.post(LOGIN_URL, data=payload, timeout=15)
 
         if response.url == LOGIN_URL or "login" in response.url:
-            st.error("Login falhou. Confira usuário/senha.")
+            st.error("Login falhou. Confira seu usuário e senha.")
             return None
 
         return session
@@ -131,7 +150,6 @@ def login_pabx():
 
 
 def get_session():
-    """Garante sessão válida, refazendo login se necessário."""
     session = st.session_state.get("session_pabx")
     if session is None:
         session = login_pabx()
@@ -154,15 +172,16 @@ def fetch_with_relogin(url):
 
 
 # ============================================================
-# SCRAPER GENÉRICO DE TABELA (mapeia por nome de coluna, não índice)
+# 4. NORMALIZAÇÃO E SCRAPING DE TABELAS
 # ============================================================
 def _normalizar(texto):
+    """Remove acentos, espaços extras e converte para minúsculas para match seguro de colunas."""
     texto = unicodedata.normalize("NFKD", texto).encode("ascii", "ignore").decode()
     return texto.strip().lower()
 
 
 def extrair_tabela(html):
-    """Retorna lista de dicts {nome_coluna_normalizado: valor} lendo o thead."""
+    """Lê o HTML, identifica os cabeçalhos do thead e retorna dicionários mapeados com '_raw'."""
     soup = BeautifulSoup(html, "html.parser")
     tabela = soup.find("table")
     if not tabela:
@@ -173,6 +192,8 @@ def extrair_tabela(html):
         cabecalhos = [_normalizar(th.get_text()) for th in thead.find_all("th")]
     else:
         primeira_linha = tabela.find("tr")
+        if not primeira_linha:
+            return [], 1
         cabecalhos = [_normalizar(td.get_text()) for td in primeira_linha.find_all(["th", "td"])]
 
     corpo = tabela.find("tbody") or tabela
@@ -184,11 +205,14 @@ def extrair_tabela(html):
         if not celulas:
             continue
         valores = [c.get_text().strip() for c in celulas]
+        if len(valores) != len(cabecalhos):
+            # Linha desalinhada com o cabeçalho (ex: linhas de resumo)
+            continue
         registro = dict(zip(cabecalhos, valores))
         registro["_raw"] = valores
         registros.append(registro)
 
-    # paginação
+    # Identificação de paginação
     ultima_pagina = 1
     paginacao = soup.find("ul", class_="pagination")
     if paginacao:
@@ -207,13 +231,14 @@ def extrair_tabela(html):
 def buscar_paginado(url_base):
     resp = fetch_with_relogin(url_base)
     if resp is None or resp.status_code != 200:
-        st.error("Erro ao acessar o relatório (verifique login/URL).")
+        st.error(f"Erro ao acessar relatório na URL: {url_base}")
         return []
 
     registros, ultima_pagina = extrair_tabela(resp.text)
 
     for page in range(2, ultima_pagina + 1):
-        resp = fetch_with_relogin(f"{url_base}&page={page}")
+        separator = "&" if "?" in url_base else "?"
+        resp = fetch_with_relogin(f"{url_base}{separator}page={page}")
         if resp is None:
             continue
         novos, _ = extrair_tabela(resp.text)
@@ -223,27 +248,38 @@ def buscar_paginado(url_base):
 
 
 # ============================================================
-# CONSULTAS ESPECÍFICAS
+# 5. PARSERS ESPECÍFICOS POR RELATÓRIO
 # ============================================================
-def consultar_cdr(numero, data_inicial, data_final, ramal_destino="", tipo_chamada="IN"):
-    """tipo_chamada: 'IN' = recebidas, 'OUT' = originadas, '' = todas.
-    Deixe numero_origem vazio para trazer TODAS as recebidas do dia
-    (útil pra auditoria geral, não só de um telefone específico)."""
-    url = (f"{CDR_URL}?ramal_origem=&numero_origem={numero}&ramal_destino={ramal_destino}"
+def parse_tecnico_ramal(texto_destino):
+    """Separa 'Gabriel Tomaz < 108 >' em ('Gabriel Tomaz', '108')."""
+    if not texto_destino:
+        return None, None
+    match = re.search(r"^(.*?)\s*<\s*(\d+)\s*>$", texto_destino)
+    if match:
+        return match.group(1).strip(), match.group(2).strip()
+    return texto_destino, None
+
+
+def consultar_cdr(numero, data_inicial, data_final, tipo_chamada="IN"):
+    url = (f"{CDR_URL}?ramal_origem=&numero_origem={numero}&ramal_destino="
            f"&numero_destino=&did=&status_chamada=&centrocusto_id=&tipo_chamada={tipo_chamada}"
            f"&gravacao=&discador=0&data_inicial={data_inicial}&data_final={data_final}")
+    
     registros = buscar_paginado(url)
-
     linhas = []
     for r in registros:
+        dest_bruto = r.get("destino") or r.get("ramal destino") or r.get("ramal")
+        tecnico, ramal_dest = parse_tecnico_ramal(dest_bruto)
+        
         linhas.append({
             "origem_relatorio": "cdr",
+            "call_id": r.get("call id") or r.get("id"),
             "data_hora": r.get("data") or r.get("data/hora") or r.get("data hora"),
             "numero_origem": r.get("origem") or numero,
-            "numero_destino": r.get("destino"),
+            "numero_destino": r.get("destino_numero") or None,
             "ramal_origem": r.get("ramal origem"),
-            "ramal_destino": r.get("ramal destino") or r.get("ramal"),
-            "tecnico": r.get("agente") or r.get("tecnico"),
+            "ramal_destino": ramal_dest,
+            "tecnico": tecnico,
             "status": r.get("status") or r.get("status chamada"),
             "duracao": r.get("duracao") or r.get("tempo"),
             "fila_id": r.get("fila"),
@@ -252,21 +288,36 @@ def consultar_cdr(numero, data_inicial, data_final, ramal_destino="", tipo_chama
     return linhas
 
 
-def consultar_recusa_pa(fila_id, data_inicial, data_final):
+def consultar_recusa_pa(fila_id, data_inicial, data_final, numero_filtro=None):
+    """
+    Consulta o relatório de recusas na P.A. 
+    O relatório da Evence retorna TODAS as recusas da fila no período. 
+    Fazemos o filtro local pelo campo 'bina' (número do cliente) para precisão cirúrgica.
+    """
     url = f"{RECUSA_PA_URL}?fila_id={fila_id}&data_inicial={data_inicial}&data_final={data_final}"
     registros = buscar_paginado(url)
 
     linhas = []
     for r in registros:
+        bina = r.get("bina") or r.get("numero") or r.get("cliente") or r.get("origem")
+        
+        # Se foi passado um número para busca, aplicamos o filtro exato no Bina
+        if numero_filtro and numero_filtro.strip():
+            if not bina or numero_filtro.strip() not in bina:
+                continue
+
+        tecnico_val = r.get("agente") or r.get("tecnico")
+        
         linhas.append({
             "origem_relatorio": "recusa_pa",
+            "call_id": r.get("call id") or r.get("id"),
             "data_hora": r.get("data") or r.get("data/hora"),
-            "numero_origem": r.get("numero") or r.get("cliente") or r.get("origem"),
+            "numero_origem": bina,
             "numero_destino": None,
             "ramal_origem": None,
             "ramal_destino": r.get("ramal"),
-            "tecnico": r.get("agente") or r.get("tecnico"),
-            "status": "recusada_ou_nao_atendida",
+            "tecnico": tecnico_val,
+            "status": "recusada_na_pa",
             "duracao": r.get("duracao") or r.get("tempo"),
             "fila_id": fila_id,
             "raw_linha": r.get("_raw"),
@@ -275,42 +326,10 @@ def consultar_recusa_pa(fila_id, data_inicial, data_final):
 
 
 # ============================================================
-# API OFICIAL (token) - contadores em tempo real da fila
-# ============================================================
-def get_api_token():
-    try:
-        return st.secrets["pabx"]["api_token"]
-    except Exception:
-        return os.environ.get("PABX_API_TOKEN", "")
-
-
-def consultar_api_queue_stats(fila_id):
-    """Usa /api/v1/queues/stats (com api_token) para pegar os contadores
-    oficiais da fila (atendidas, abandonadas, TME, TMA). Serve como
-    conferência: se os contadores oficiais não baterem com o que o
-    scraping dos relatórios trouxe, há algo a investigar na coleta."""
-    token = get_api_token()
-    if not token:
-        st.warning("api_token não configurado (secrets.toml -> [pabx] api_token = '...') — pulando conferência via API.")
-        return None
-    url = f"{BASE_URL}/api/v1/queues/stats?api_token={token}&queue={fila_id}"
-    try:
-        resp = requests.get(url, timeout=15)
-        data = resp.json()
-        if "error" in data:
-            st.error(f"Erro da API: {data['error']}")
-            return None
-        return data.get("queueList")
-    except requests.RequestException as e:
-        st.error(f"Erro ao consultar API: {e}")
-        return None
-
-
-# ============================================================
-# CLASSIFICAÇÃO recusada vs abandono/timeout (heurística por duração)
+# 6. HEURÍSTICA DE CLASSIFICAÇÃO
 # ============================================================
 LIMITE_RECUSA_SEGUNDOS = st.sidebar.number_input(
-    "Limite (s) p/ considerar 'recusa manual' (abaixo disso)", value=3, min_value=0
+    "Limite (s) para 'recusa manual'", value=3, min_value=0
 )
 
 
@@ -333,93 +352,104 @@ def classificar(duracao_txt):
         return "indeterminado"
     if seg <= LIMITE_RECUSA_SEGUNDOS:
         return "provável recusa manual"
-    return "tocou até esgotar (não atendida)"
+    return "tocou até esgotar"
 
 
 # ============================================================
-# UI
+# 7. INTERFACE STREAMLIT (Abas)
 # ============================================================
 conn = init_db()
 
+# Ferramenta de reset de banco na barra lateral para evitar resíduos antigos
+if st.sidebar.button("⚠️ Resetar Banco Local"):
+    conn.close()
+    init_db(reset=True)
+    conn = init_db()
+    st.sidebar.success("Banco limpo com sucesso!")
+
 tab_busca, tab_coleta, tab_mensal = st.tabs(
-    ["🔎 Auditoria por telefone", "⬇️ Coletar dados", "📅 Fechamento mensal"]
+    ["🔎 Auditoria por Telefone", "⬇️ Coletar Dados", "📅 Fechamento Mensal"]
 )
 
 with tab_coleta:
-    st.subheader("Coletar dados dos relatórios e salvar no banco local")
+    st.subheader("Coleta Automatizada de Relatórios (CDR + Recusas P.A.)")
     col1, col2 = st.columns(2)
     with col1:
         numero = st.text_input(
-            "Telefone do cliente (numero_origem no CDR) — deixe vazio para trazer TODAS as recebidas do dia",
-            ""
+            "Telefone do Cliente (Ex: 1143820682) — Deixe vazio para puxar todo o dia",
+            "1143820682"
         )
-        fila_id = st.text_input("Fila ID", "2812")
+        fila_id = st.text_input("Fila ID (Ex: 2812 ou vazio)", "2812")
     with col2:
-        data_inicio = st.date_input("Data início", value=date.today())
-        data_fim = st.date_input("Data fim", value=date.today())
+        data_inicio = st.date_input("Data Início", value=date(2026, 7, 28))
+        data_fim = st.date_input("Data Fim", value=date(2026, 7, 28))
 
-    tipo_chamada = st.selectbox("Tipo de chamada (CDR)", ["IN", "OUT", ""], index=0,
-                                 help="IN = recebidas (o que você quer auditar), OUT = originadas, vazio = todas")
+    tipo_chamada = st.selectbox("Tipo de Chamada (CDR)", ["IN", "OUT", ""], index=0)
 
-    if st.button("Buscar e salvar"):
-        di, df = data_inicio.strftime("%d-%m-%Y"), data_fim.strftime("%d-%m-%Y")
-        with st.spinner("Consultando CDR sintético..."):
-            linhas_cdr = consultar_cdr(numero, di, df, tipo_chamada=tipo_chamada)
-        with st.spinner("Consultando recusas na P.A..."):
-            di2, df2 = data_inicio.strftime("%Y-%m-%d"), data_fim.strftime("%Y-%m-%d")
-            linhas_recusa = consultar_recusa_pa(fila_id, di2, df2)
+    if st.button("Executar Coleta e Salvar"):
+        di_cdr, df_cdr = data_inicio.strftime("%d-%m-%Y"), data_fim.strftime("%d-%m-%Y")
+        di_pa, df_pa = data_inicio.strftime("%Y-%m-%d"), data_fim.strftime("%Y-%m-%d")
 
-        salvar_linhas(conn, linhas_cdr + linhas_recusa)
-        st.success(f"Salvo: {len(linhas_cdr)} linhas de CDR + {len(linhas_recusa)} linhas de recusa-PA")
-        st.dataframe(pd.DataFrame(linhas_cdr + linhas_recusa))
+        with st.spinner("Buscando CDR Sintético..."):
+            linhas_cdr = consultar_cdr(numero, di_cdr, df_cdr, tipo_chamada=tipo_chamada)
+            
+        with st.spinner("Buscando Recusas na P.A. (com filtro no Bina)..."):
+            linhas_recusa = consultar_recusa_pa(fila_id, di_pa, df_pa, numero_filtro=numero)
 
-        with st.spinner("Conferindo contadores oficiais via API..."):
-            stats = consultar_api_queue_stats(fila_id)
-        if stats:
-            st.subheader("Conferência (API oficial /queues/stats — dados atuais da fila)")
-            c1, c2, c3, c4 = st.columns(4)
-            c1.metric("Atendidas (total)", stats.get("totalChamadasAtendidas", "-"))
-            c2.metric("Abandonadas (total)", stats.get("totalChamadasAbandonadas", "-"))
-            c3.metric("TME", stats.get("TME", "-"))
-            c4.metric("TMA", stats.get("TMA", "-"))
-            st.caption("Nota: a API traz contadores acumulados atuais da fila, não filtrados por data — "
-                       "use apenas como conferência de consistência, não como fonte do relatório mensal.")
+        total_salvos = salvar_linhas(conn, linhas_cdr + linhas_recusa)
+        st.success(f"Coleta finalizada! {total_salvos} novos registros inseridos (duplicatas bloqueadas automaticamente).")
+        
+        combined = linhas_cdr + linhas_recusa
+        if combined:
+            st.dataframe(pd.DataFrame(combined))
+        else:
+            st.info("Nenhum registro retornado para os filtros informados.")
 
 with tab_busca:
-    st.subheader("Timeline completa de um número")
-    numero_busca = st.text_input("Telefone para auditar", key="busca_telefone")
-    if st.button("Auditar número"):
-        df = pd.read_sql_query(
+    st.subheader("Timeline e Auditoria Completa por Número")
+    numero_busca = st.text_input("Digite o telefone do cliente para rastrear:", "1143820682")
+    
+    if st.button("Gerar Auditoria do Número"):
+        df_busca = pd.read_sql_query(
             "SELECT * FROM chamadas WHERE numero_origem LIKE ? OR numero_destino LIKE ? ORDER BY data_hora",
             conn, params=(f"%{numero_busca}%", f"%{numero_busca}%")
         )
-        if df.empty:
-            st.warning("Nenhum registro encontrado para esse número (colete os dados na aba anterior primeiro).")
+        if df_busca.empty:
+            st.warning("Nenhum registro encontrado para este número na base local. Realize a coleta na aba ao lado.")
         else:
-            df["classificacao_estimada"] = df["duracao"].apply(classificar)
-            st.dataframe(df[["data_hora", "origem_relatorio", "tecnico", "ramal_destino",
-                              "status", "duracao", "classificacao_estimada"]])
+            df_busca["classificacao_estimada"] = df_busca["duracao"].apply(classificar)
+            st.success(f"Encontrados {len(df_busca)} eventos para o número {numero_busca}:")
+            st.dataframe(df_busca[[
+                "data_hora", "origem_relatorio", "tecnico", "ramal_destino",
+                "status", "duracao", "classificacao_estimada", "call_id"
+            ]])
 
 with tab_mensal:
-    st.subheader("Resumo mensal por técnico")
-    mes = st.text_input("Filtro de mês (formato livre, ex: 2026-07)", "")
+    st.subheader("Fechamento Mensal por Técnico")
+    mes = st.text_input("Filtro de Mês (Formato: YYYY-MM ou DD-MM-YYYY, ex: 2026-07)", "2026-07")
+    
     query = "SELECT * FROM chamadas"
     params = ()
     if mes:
         query += " WHERE data_hora LIKE ?"
         params = (f"%{mes}%",)
-    df = pd.read_sql_query(query, conn, params=params)
+        
+    df_mes = pd.read_sql_query(query, conn, params=params)
 
-    if df.empty:
-        st.warning("Sem dados coletados ainda.")
+    if df_mes.empty:
+        st.warning("Nenhum dado encontrado para o período.")
     else:
-        resumo = df.groupby(["tecnico", "status"]).size().reset_index(name="quantidade")
+        resumo = df_mes.groupby(["tecnico", "status"]).size().reset_index(name="quantidade")
         st.dataframe(resumo)
 
-        fig = px.bar(resumo, x="tecnico", y="quantidade", color="status",
-                     title="Chamadas por técnico e status", barmode="group")
+        fig = px.bar(
+            resumo, x="tecnico", y="quantidade", color="status",
+            title="Desempenho de Chamadas por Técnico e Status", barmode="group"
+        )
         st.plotly_chart(fig, use_container_width=True)
 
-        csv = df.to_csv(index=False).encode("utf-8")
-        st.download_button("Baixar CSV para planilha de desempenho", csv,
-                            "relatorio_mensal_pabx.csv", "text/csv")
+        csv = df_mes.to_csv(index=False).encode("utf-8")
+        st.download_button(
+            "📥 Baixar Relatório Mensal em CSV", csv,
+            "relatorio_mensal_pabx.csv", "text/csv"
+        )
