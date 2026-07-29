@@ -101,7 +101,7 @@ if st.sidebar.button("🔄 Sincronizar Dados da API Evence"):
     indice = 0
     total_inseridos = 0
     
-    with st.spinner("Sincronizando logs do PABX..."):
+    with st.spinner("Sincronizando logs completos do PABX (Isso pode levar alguns segundos)..."):
         while True:
             url = f"{BASE_URL}?api_token={API_TOKEN}&datainicio={data_inicio}&datafinal={data_fim}&indice={indice}"
             try:
@@ -112,22 +112,30 @@ if st.sidebar.button("🔄 Sincronizar Dados da API Evence"):
                 if "error" in data:
                     break
                 
-                cdr_dict = data.get("cdr", {})
-                if not cdr_dict:
+                # A Evence costuma retornar os dados dentro da chave 'cdr' ou como uma lista direta
+                cdr_dict = data.get("cdr", data)
+                if not cdr_dict or len(cdr_dict) == 0:
                     break 
                 
                 salvar_no_banco(cdr_dict)
                 qtd = len(cdr_dict)
                 total_inseridos += qtd
-                indice += qtd 
                 
+                # Se o retorno for menor que o lote padrão ou se repetir o índice, evita loop infinito
                 if qtd == 0:
                     break
-            except Exception:
+                
+                indice += qtd 
+                
+                # Segurança extra: se a API retornar menos de 1 item novo, encerra para evitar travamento
+                if isinstance(cdr_dict, dict) and len(cdr_dict) == 0:
+                    break
+            except Exception as e:
+                st.sidebar.error(f"Erro na sincronização: {e}")
                 break
                 
-    st.sidebar.success(f"Sincronização concluída! {total_inseridos} eventos carregados.")
-
+    st.sidebar.success(f"Sincronização concluída! Total de {total_inseridos} eventos carregados.")
+    
 df_geral = carregar_do_banco(data_inicio, data_fim)
 
 # ==========================================
