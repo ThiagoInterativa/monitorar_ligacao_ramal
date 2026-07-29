@@ -15,7 +15,7 @@ BASE_URL = "https://pabx.evence.com.br/api/v1/cdr"
 
 def extrair_tecnico_forca_bruta(item_bruto):
     """
-    Varre qualquer estrutura (lista, dicionário ou string) em busca do padrão Asterisk: Nome <ramal>
+    Varre qualquer estrutura em busca do padrão Asterisk: Nome <ramal>
     """
     if isinstance(item_bruto, (list, tuple)):
         texto_unificado = " ".join([str(x) for x in item_bruto])
@@ -24,7 +24,6 @@ def extrair_tecnico_forca_bruta(item_bruto):
     else:
         texto_unificado = str(item_bruto)
 
-    # Procura por padrões como "Gabriel Tomaz < 108 >" ou 'Gabriel Tomaz' <108>
     match = re.search(r'"?([^"<]+)"?\s*<\s*(\d+)\s*>', texto_unificado)
     if match:
         nome = match.group(1).strip().replace('"', '')
@@ -35,9 +34,8 @@ def extrair_tecnico_forca_bruta(item_bruto):
 def init_db():
     conn = sqlite3.connect("cdr_nao_atendidas.db")
     cursor = conn.cursor()
-    cursor.execute("DROP TABLE IF EXISTS todas_chamadas")
     cursor.execute("""
-        CREATE TABLE todas_chamadas (
+        CREATE TABLE IF NOT EXISTS todas_chamadas (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             data_hora TEXT,
             origem TEXT,
@@ -54,11 +52,17 @@ def init_db():
 
 init_db()
 
+def limpar_banco():
+    conn = sqlite3.connect("cdr_nao_atendidas.db")
+    cursor = conn.cursor()
+    cursor.execute("DELETE FROM todas_chamadas")
+    conn.commit()
+    conn.close()
+
 def salvar_no_banco(registros):
     conn = sqlite3.connect("cdr_nao_atendidas.db")
     cursor = conn.cursor()
     
-    # Se a API retornar um dicionário ou lista de registros
     if isinstance(registros, dict):
         itens = registros.values()
     else:
@@ -66,7 +70,6 @@ def salvar_no_banco(registros):
 
     for reg in itens:
         try:
-            # Garante que conseguimos extrair o técnico de qualquer formato que a API mande (lista ou string)
             tecnico_encontrado = extrair_tecnico_forca_bruta(reg)
             
             if isinstance(reg, (list, tuple)) and len(reg) >= 6:
@@ -78,7 +81,6 @@ def salvar_no_banco(registros):
                 status = str(reg[5]) if len(reg) > 5 else ""
                 tipo = str(reg[6]) if len(reg) > 6 else "Desconhecido"
             else:
-                # Fallback caso venha em formato de texto bruto ou dicionário alternativo
                 data_hora = ""
                 origem = str(reg)
                 destino = ""
@@ -88,7 +90,7 @@ def salvar_no_banco(registros):
                 tipo = "Desconhecido"
 
             if not tecnico_encontrado:
-                tecnico_encontrado = "Fila de Atendimento Geral"
+                tecnico_encontrado = "Fila / Sem Atribuicao"
 
             cursor.execute("""
                 INSERT INTO todas_chamadas 
@@ -115,12 +117,17 @@ def carregar_do_banco(data_inicio, data_fim):
 
 # ===== MENU LATERAL =====
 st.sidebar.header("Navegação & Filtros")
-menu = st.sidebar.radio("Escolha a Opção", ["Dashboard Geral", "🔍 Auditoria de Log por Telefone"])
+menu = st.sidebar.radio("Escolha a Opção", [
+    "Dashboard Geral", 
+    "🔍 Auditoria de Log por Telefone", 
+    "📈 Desempenho por Técnico (Relatório)"
+])
 
 data_inicio = st.sidebar.date_input("Data início")
 data_fim = st.sidebar.date_input("Data fim")
 
-if st.sidebar.button("Sincronizar Dados da API Evence"):
+if st.sidebar.button("🔄 Sincronizar Dados da API Evence"):
+    limpar_banco()
     indice = 0
     total_inseridos = 0
     sucesso_busca = False
@@ -159,12 +166,6 @@ if st.sidebar.button("Sincronizar Dados da API Evence"):
     else:
         st.sidebar.warning("Nenhum registro retornado pela API para este período.")
 
-with st.sidebar.expander("🛠️ Inspecionar Log Bruto da API"):
-    if "ultimo_json_bruto" in st.session_state and st.session_state["ultimo_json_bruto"]:
-        st.json(st.session_state["ultimo_json_bruto"])
-    else:
-        st.info("Clique em 'Sincronizar Dados da API Evence' para capturar o log bruto.")
-
 df_geral = carregar_do_banco(data_inicio, data_fim)
 
 # ==========================================
@@ -176,37 +177,39 @@ if menu == "Dashboard Geral":
     if not df_geral.empty:
         df_abandonadas = df_geral[df_geral["status"].str.lower().str.contains("abandonada", na=False)]
         
+        col1, col2, col3 = st.columns(3)
+        col1.metric("Total de Chamadas no Período", len(df_geral))
+        col2.metric("Chamadas Abandonadas / Perdidas", len(df_abandonadas))
+        taxa_ab = (len(df_abandonadas) / len(df_geral)) * 100 if len(df_geral) > 0 else 0
+        col3.metric("Taxa de Abandono", f"{taxa_ab:.2f}%")
+        
         if not df_abandonadas.empty:
             contagem = df_abandonadas["tecnico_formatado"].value_counts().reset_index()
             contagem.columns = ["Técnico / Origem", "Quantidade"]
-
-            cols = st.columns(4)
-            for i, row in contagem.head(4).iterrows():
-                cols[i % 4].metric(str(row['Técnico / Origem']), int(row['Quantidade']))
 
             fig = px.pie(
                 contagem,
                 names="Técnico / Origem",
                 values="Quantidade",
-                title="Proporção de Chamadas Abandonadas"
+                title="Proporção de Chamadas Não Atendidas por Técnico/Fila"
             )
             st.plotly_chart(fig, use_container_width=True)
 
-            st.subheader("Detalhamento Geral")
+            st.subheader("Detalhamento de Chamadas Não Atendidas")
             st.dataframe(df_abandonadas[["data_hora", "origem", "destino", "tecnico_formatado", "status", "tipo"]])
         else:
             st.info("Nenhuma chamada abandonada registrada neste período.")
     else:
-        st.info("Banco de dados vazio para este período. Sincronize os dados.")
+        st.info("Banco de dados vazio para este período. Clique em sincronizar na barra lateral.")
 
 # ==========================================
 # OPÇÃO 2: AUDITORIA DE LOG POR TELEFONE
 # ==========================================
 elif menu == "🔍 Auditoria de Log por Telefone":
     st.subheader("🔍 Rastreio e Auditoria de Chamada por Número de Cliente")
-    st.markdown("Digite o número do telefone do cliente para rastrear por onde passou a ligação.")
+    st.markdown("Digite o número do telefone do cliente para rastrear o caminho completo da ligação.")
     
-    telefone_busca = st.text_input("Número do Telefone do Cliente:", "")
+    telefone_busca = st.text_input("Número do Telefone do Cliente (Ex: 11999998888):", "")
     
     if telefone_busca:
         if not df_geral.empty:
@@ -230,13 +233,37 @@ elif menu == "🔍 Auditoria de Log por Telefone":
                       * **Origem (Bina):** `{row['origem']}`  
                       * **Destino / Fila:** `{row['destino']}`  
                       * **Atendente / Técnico Envolvido:** `⭐ {row['tecnico_formatado']}`  
-                      * **Status:** `{status_str}` | **Tipo da Chamada:** `{row['tipo']}` | **Duração:** `{row['duracao']}`
+                      * **Status:** `{status_str}` | **Tipo:** `{row['tipo']}` | **Duração:** `{row['duracao']}`
                     """)
                 
                 st.markdown("---")
                 st.subheader("Tabela Analítica Completa para Auditoria")
                 st.dataframe(df_cliente[["data_hora", "origem", "destino", "canal_ramal", "tecnico_formatado", "status", "tipo", "duracao"]])
             else:
-                st.warning(f"Nenhum registro encontrado para '{telefone_busca}'. Verifique se o período das datas abrange esse dia.")
+                st.warning(f"Nenhum registro encontrado para '{telefone_busca}'. Verifique o número e o período.")
         else:
             st.warning("Sincronize a API primeiro.")
+
+# ==========================================
+# OPÇÃO 3: DESEMPENHO POR TÉCNICO
+# ==========================================
+elif menu == "📈 Desempenho por Técnico (Relatório)":
+    st.subheader("📈 Relatório de Ocorrências por Técnico")
+    st.markdown("Use este relatório consolidado para reuniões de feedback e alinhamento com a chefia.")
+    
+    if not df_geral.empty:
+        df_nao_atendidos = df_geral[df_geral["status"].str.lower().str.contains("abandonada", na=False)]
+        
+        if not df_nao_atendidos.empty:
+            resumo_tec = df_nao_atendidos["tecnico_formatado"].value_counts().reset_index()
+            resumo_tec.columns = ["Técnico / Ramal", "Chamadas Não Atendidas"]
+            
+            st.dataframe(resumo_tec, use_container_width=True)
+            
+            st.info("""
+            **Dica de Liderança:** Com este painel, você consegue demonstrar exatamente quais ramais estão deixando chamadas acumularem ou tocarem no vazio, fundamentando conversas construtivas de cobrança de SLA com a equipe, mesmo à distância.
+            """)
+        else:
+            st.success("Parabéns! Nenhuma chamada não atendida registrada no período selecionado.")
+    else:
+        st.info("Sincronize os dados da API para visualizar o relatório.")
