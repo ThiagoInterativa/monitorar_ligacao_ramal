@@ -1,125 +1,372 @@
-import streamlit as st
-import pandas as pd
+"""
+Auditoria PABX Evence
+======================
+Faz login no painel (sessão + CSRF), consulta os relatórios:
+  - CDR sintético (/cdr/pesquisar)         -> filtra por telefone/data
+  - Recusas na P.A. (/callcenter/relatorios/recusa-pa) -> filtra por fila/data
+Salva tudo em SQLite local (pabx_audit.db) para permitir:
+  - busca de auditoria por telefone (histórico completo do número)
+  - fechamento mensal por técnico (taxa de recusa/abandono, tempo médio)
+
+CONFIGURAÇÃO DE CREDENCIAIS (não coloque senha no código!):
+  Crie um arquivo .streamlit/secrets.toml com:
+    [pabx]
+    login = "seu_usuario"
+    senha = "sua_senha"
+  Ou defina as variáveis de ambiente PABX_LOGIN e PABX_SENHA.
+"""
+
+import os
 import sqlite3
-from datetime import date
+import unicodedata
+from datetime import date, datetime
+
+import pandas as pd
+import plotly.express as px
+import requests
+import streamlit as st
+from bs4 import BeautifulSoup
 
 st.set_page_config(layout="wide")
-st.title("📊 Sistema Unificado de Auditoria de Chamadas (Evence)")
+st.title("📊 Auditoria de Chamadas - PABX")
 
-# Banco de dados centralizado
+BASE_URL = "https://pabx.evence.com.br"
+LOGIN_URL = f"{BASE_URL}/login"
+CDR_URL = f"{BASE_URL}/cdr/pesquisar"
+RECUSA_PA_URL = f"{BASE_URL}/callcenter/relatorios/recusa-pa"
+DB_PATH = os.path.join(os.path.dirname(__file__), "pabx_audit.db")
+
+
+# ============================================================
+# CREDENCIAIS (nunca hardcode - use secrets.toml ou env vars)
+# ============================================================
+def get_credentials():
+    try:
+        return st.secrets["pabx"]["login"], st.secrets["pabx"]["senha"]
+    except Exception:
+        login = os.environ.get("PABX_LOGIN", "")
+        senha = os.environ.get("PABX_SENHA", "")
+        return login, senha
+
+
+# ============================================================
+# BANCO DE DADOS
+# ============================================================
 def init_db():
-    conn = sqlite3.connect("auditoria_unificada.db")
-    cursor = conn.cursor()
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS historico_unificado (
+    conn = sqlite3.connect(DB_PATH)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS chamadas (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
+            origem_relatorio TEXT,      -- 'cdr' ou 'recusa_pa'
             data_hora TEXT,
-            origem TEXT,
-            destino TEXT,
+            numero_origem TEXT,
+            numero_destino TEXT,
+            ramal_origem TEXT,
+            ramal_destino TEXT,
+            tecnico TEXT,
             status TEXT,
-            tipo_origem TEXT,
-            detalhes TEXT
+            duracao TEXT,
+            fila_id TEXT,
+            raw_linha TEXT,
+            coletado_em TEXT,
+            UNIQUE(origem_relatorio, data_hora, numero_origem, numero_destino, ramal_destino)
         )
     """)
     conn.commit()
-    conn.close()
+    return conn
 
-init_db()
 
-# ===== MENU LATERAL E FILTROS =====
-st.sidebar.header("⚙️ Configuração & Filtros")
-menu = st.sidebar.radio("Navegação", ["🔍 Pesquisa Unificada por Telefone", "📥 Importar / Alimentar Dados"])
+def salvar_linhas(conn, linhas):
+    """linhas: lista de dicts com as chaves da tabela"""
+    cur = conn.cursor()
+    for linha in linhas:
+        cur.execute("""
+            INSERT OR IGNORE INTO chamadas
+            (origem_relatorio, data_hora, numero_origem, numero_destino,
+             ramal_origem, ramal_destino, tecnico, status, duracao, fila_id,
+             raw_linha, coletado_em)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
+        """, (
+            linha.get("origem_relatorio"), linha.get("data_hora"),
+            linha.get("numero_origem"), linha.get("numero_destino"),
+            linha.get("ramal_origem"), linha.get("ramal_destino"),
+            linha.get("tecnico"), linha.get("status"), linha.get("duracao"),
+            linha.get("fila_id"), str(linha.get("raw_linha")),
+            datetime.now().isoformat()
+        ))
+    conn.commit()
 
-st.sidebar.markdown("---")
-st.sidebar.subheader("Filtros de Período")
-data_inicio = st.sidebar.date_input("Data Inicial", date(2026, 7, 1))
-data_fim = st.sidebar.date_input("Data Final", date(2026, 7, 31))
 
-telefone_busca = st.sidebar.text_input("Número do Cliente (Filtro)", "1143820682")
+# ============================================================
+# LOGIN / SESSÃO
+# ============================================================
+def login_pabx():
+    login, senha = get_credentials()
+    if not login or not senha:
+        st.error("Credenciais não configuradas. Preencha secrets.toml ou variáveis de ambiente PABX_LOGIN/PABX_SENHA.")
+        return None
 
-# ==========================================
-# OPÇÃO 1: PESQUISA UNIFICADA
-# ==========================================
-if menu == "🔍 Pesquisa Unificada por Telefone":
-    st.subheader(f"🔍 Auditoria Cruzada para o Telefone: `{telefone_busca}` ({data_inicio} até {data_fim})")
-    st.markdown("O sistema cruza as informações de CDR Sintético, Recusas na P.A. e Fila para montar a linha do tempo exata.")
+    session = requests.Session()
+    session.headers.update({"User-Agent": "Mozilla/5.0"})
 
-    if telefone_busca:
-        conn = sqlite3.connect("auditoria_unificada.db")
-        # Busca básica por telefone na tabela
-        query = f"SELECT * FROM historico_unificado WHERE (origem LIKE '%{telefone_busca}%' OR destino LIKE '%{telefone_busca}%' OR detalhes LIKE '%{telefone_busca}%')"
-        df_resultado = pd.read_sql_query(query, conn)
-        conn.close()
+    try:
+        r = session.get(LOGIN_URL, timeout=15)
+        soup = BeautifulSoup(r.text, "html.parser")
+        csrf = soup.find("input", {"name": "_token"})
+        if not csrf:
+            st.error("Não encontrei o token CSRF na página de login. O layout pode ter mudado.")
+            return None
 
-        if not df_resultado.empty:
-            # Converte a data para objeto datetime para filtrar corretamente por período
-            df_resultado["data_obj"] = pd.to_datetime(df_resultado["data_hora"], format="%d-%m-%Y %H:%M:%S", errors="coerce")
-            
-            # Aplica o filtro de data inicial e final
-            mask = (df_resultado["data_obj"].dt.date >= data_inicio) & (df_resultado["data_obj"].dt.date <= data_fim)
-            df_filtrado = df_resultado.loc[mask].sort_values(by="data_obj", ascending=True)
+        payload = {"login": login, "senha": senha, "_token": csrf["value"]}
+        response = session.post(LOGIN_URL, data=payload, timeout=15)
 
-            if not df_filtrado.empty:
-                st.success(f"Encontrados {len(df_filtrado)} eventos consolidados para este número no período selecionado.")
-                
-                st.markdown("### 🗺️ Linha do Tempo Unificada (Da Chamada à Resposta)")
-                
-                for idx, row in df_filtrado.iterrows():
-                    status = str(row["status"]).lower()
-                    
-                    if "atendida" in status:
-                        icone = "🟢 [ATENDIDA]"
-                    elif "abandonada" in status:
-                        icone = "🔴 [ABANDONADA / DESISTIU]"
-                    elif "recusada" in status or "intercom" in status:
-                        icone = "🟠 [RECUSADA NA P.A. / TRANSFERIDA]"
-                    else:
-                        icone = "🔵 [EVENTO PABX]"
+        if response.url == LOGIN_URL or "login" in response.url:
+            st.error("Login falhou. Confira usuário/senha.")
+            return None
 
-                    st.markdown(f"""
-                    ---
-                    #### {icone} — `{row['data_hora']}`
-                    * **Origem / Cliente:** `{row['origem']}`
-                    * **Destino / Ramal / Atendente:** `{row['destino']}`
-                    * **Status da Ocorrência:** `{row['status']}`
-                    * **Origem do Log:** `{row['tipo_origem']}`
-                    * *Detalhes:* `{row['detalhes']}`
-                    """)
-                
-                st.markdown("---")
-                st.subheader("Tabela Analítica Completa")
-                st.dataframe(df_filtrado[["data_hora", "origem", "destino", "status", "tipo_origem", "detalhes"]])
-            else:
-                st.warning("Existem registros para este número, mas nenhum dentro do intervalo de datas selecionado na barra lateral.")
-        else:
-            st.warning("Nenhum registro unificado encontrado para este número. Insira os dados na aba de importação ou verifique o número.")
+        return session
+    except requests.RequestException as e:
+        st.error(f"Erro de conexão no login: {e}")
+        return None
+
+
+def get_session():
+    """Garante sessão válida, refazendo login se necessário."""
+    session = st.session_state.get("session_pabx")
+    if session is None:
+        session = login_pabx()
+        st.session_state.session_pabx = session
+    return session
+
+
+def fetch_with_relogin(url):
+    session = get_session()
+    if not session:
+        return None
+    resp = session.get(url, timeout=20)
+    if "login" in resp.url:
+        session = login_pabx()
+        st.session_state.session_pabx = session
+        if not session:
+            return None
+        resp = session.get(url, timeout=20)
+    return resp
+
+
+# ============================================================
+# SCRAPER GENÉRICO DE TABELA (mapeia por nome de coluna, não índice)
+# ============================================================
+def _normalizar(texto):
+    texto = unicodedata.normalize("NFKD", texto).encode("ascii", "ignore").decode()
+    return texto.strip().lower()
+
+
+def extrair_tabela(html):
+    """Retorna lista de dicts {nome_coluna_normalizado: valor} lendo o thead."""
+    soup = BeautifulSoup(html, "html.parser")
+    tabela = soup.find("table")
+    if not tabela:
+        return [], 1
+
+    thead = tabela.find("thead")
+    if thead:
+        cabecalhos = [_normalizar(th.get_text()) for th in thead.find_all("th")]
     else:
-        st.info("Digite um número de telefone na barra lateral para iniciar a pesquisa.")
+        primeira_linha = tabela.find("tr")
+        cabecalhos = [_normalizar(td.get_text()) for td in primeira_linha.find_all(["th", "td"])]
 
-# ==========================================
-# OPÇÃO 2: IMPORTAR / ALIMENTAR DADOS
-# ==========================================
-elif menu == "📥 Importar / Alimentar Dados":
-    st.subheader("📥 Central de Ingestão de Dados para Auditoria")
-    st.markdown("Alimente os registros coletados dos relatórios web (`/cdr/pesquisar` e `recusa-pa`) para que o sistema cruze as informações.")
+    corpo = tabela.find("tbody") or tabela
+    linhas_html = corpo.find_all("tr")
 
-    with st.form("form_insercao"):
-        st.write("Adicionar Evento Manual / Coletado")
-        f_data = st.text_input("Data e Hora (Formato: DD-MM-YYYY HH:MM:SS)", "28-07-2026 14:10:16")
-        f_origem = st.text_input("Origem (Número do Cliente)", "1143820682")
-        f_destino = st.text_input("Destino (Ramal ou Fila, ex: Gabriel Tomaz < 108 >)", "Gabriel Tomaz < 108 >")
-        f_status = st.selectbox("Status", ["Atendida", "Recusada na P.A.", "Abandonada", "Chamada Intercom"])
-        f_tipo = st.selectbox("Fonte do Relatório", ["CDR Sintético", "Relatório de Recusa P.A.", "Fila Realtime"])
-        f_detalhes = st.text_area("Detalhes Adicionais (Ex: Duração, Agente envolvido, Transbordo)", "Duração 00:17:25 - Transferido para Vinícius")
-        
-        submitted = st.form_submit_button("Salvar na Auditoria Unificada")
-        if submitted:
-            conn = sqlite3.connect("auditoria_unificada.db")
-            cursor = conn.cursor()
-            cursor.execute("""
-                INSERT INTO historico_unificado (data_hora, origem, destino, status, tipo_origem, detalhes)
-                VALUES (?, ?, ?, ?, ?, ?)
-            """, (f_data, f_origem, f_destino, f_status, f_tipo, f_detalhes))
-            conn.commit()
-            conn.close()
-            st.success("Evento adicionado com sucesso à auditoria!")
+    registros = []
+    for linha in linhas_html:
+        celulas = linha.find_all("td")
+        if not celulas:
+            continue
+        valores = [c.get_text().strip() for c in celulas]
+        registro = dict(zip(cabecalhos, valores))
+        registro["_raw"] = valores
+        registros.append(registro)
+
+    # paginação
+    ultima_pagina = 1
+    paginacao = soup.find("ul", class_="pagination")
+    if paginacao:
+        numeros = []
+        for a in paginacao.find_all("a"):
+            try:
+                numeros.append(int(a.text.strip()))
+            except ValueError:
+                pass
+        if numeros:
+            ultima_pagina = max(numeros)
+
+    return registros, ultima_pagina
+
+
+def buscar_paginado(url_base):
+    resp = fetch_with_relogin(url_base)
+    if resp is None or resp.status_code != 200:
+        st.error("Erro ao acessar o relatório (verifique login/URL).")
+        return []
+
+    registros, ultima_pagina = extrair_tabela(resp.text)
+
+    for page in range(2, ultima_pagina + 1):
+        resp = fetch_with_relogin(f"{url_base}&page={page}")
+        if resp is None:
+            continue
+        novos, _ = extrair_tabela(resp.text)
+        registros.extend(novos)
+
+    return registros
+
+
+# ============================================================
+# CONSULTAS ESPECÍFICAS
+# ============================================================
+def consultar_cdr(numero, data_inicial, data_final, ramal_destino=""):
+    url = (f"{CDR_URL}?ramal_origem=&numero_origem={numero}&ramal_destino={ramal_destino}"
+           f"&numero_destino=&did=&status_chamada=&centrocusto_id=&tipo_chamada=&gravacao="
+           f"&discador=0&data_inicial={data_inicial}&data_final={data_final}")
+    registros = buscar_paginado(url)
+
+    linhas = []
+    for r in registros:
+        linhas.append({
+            "origem_relatorio": "cdr",
+            "data_hora": r.get("data") or r.get("data/hora") or r.get("data hora"),
+            "numero_origem": r.get("origem") or numero,
+            "numero_destino": r.get("destino"),
+            "ramal_origem": r.get("ramal origem"),
+            "ramal_destino": r.get("ramal destino") or r.get("ramal"),
+            "tecnico": r.get("agente") or r.get("tecnico"),
+            "status": r.get("status") or r.get("status chamada"),
+            "duracao": r.get("duracao") or r.get("tempo"),
+            "fila_id": r.get("fila"),
+            "raw_linha": r.get("_raw"),
+        })
+    return linhas
+
+
+def consultar_recusa_pa(fila_id, data_inicial, data_final):
+    url = f"{RECUSA_PA_URL}?fila_id={fila_id}&data_inicial={data_inicial}&data_final={data_final}"
+    registros = buscar_paginado(url)
+
+    linhas = []
+    for r in registros:
+        linhas.append({
+            "origem_relatorio": "recusa_pa",
+            "data_hora": r.get("data") or r.get("data/hora"),
+            "numero_origem": r.get("numero") or r.get("cliente") or r.get("origem"),
+            "numero_destino": None,
+            "ramal_origem": None,
+            "ramal_destino": r.get("ramal"),
+            "tecnico": r.get("agente") or r.get("tecnico"),
+            "status": "recusada_ou_nao_atendida",
+            "duracao": r.get("duracao") or r.get("tempo"),
+            "fila_id": fila_id,
+            "raw_linha": r.get("_raw"),
+        })
+    return linhas
+
+
+# ============================================================
+# CLASSIFICAÇÃO recusada vs abandono/timeout (heurística por duração)
+# ============================================================
+LIMITE_RECUSA_SEGUNDOS = st.sidebar.number_input(
+    "Limite (s) p/ considerar 'recusa manual' (abaixo disso)", value=3, min_value=0
+)
+
+
+def duracao_para_segundos(txt):
+    if not txt:
+        return None
+    try:
+        partes = [int(p) for p in txt.split(":")]
+        while len(partes) < 3:
+            partes.insert(0, 0)
+        h, m, s = partes
+        return h * 3600 + m * 60 + s
+    except (ValueError, AttributeError):
+        return None
+
+
+def classificar(duracao_txt):
+    seg = duracao_para_segundos(duracao_txt)
+    if seg is None:
+        return "indeterminado"
+    if seg <= LIMITE_RECUSA_SEGUNDOS:
+        return "provável recusa manual"
+    return "tocou até esgotar (não atendida)"
+
+
+# ============================================================
+# UI
+# ============================================================
+conn = init_db()
+
+tab_busca, tab_coleta, tab_mensal = st.tabs(
+    ["🔎 Auditoria por telefone", "⬇️ Coletar dados", "📅 Fechamento mensal"]
+)
+
+with tab_coleta:
+    st.subheader("Coletar dados dos relatórios e salvar no banco local")
+    col1, col2 = st.columns(2)
+    with col1:
+        numero = st.text_input("Telefone do cliente (numero_origem no CDR)", "1143820682")
+        fila_id = st.text_input("Fila ID", "2812")
+    with col2:
+        data_inicio = st.date_input("Data início", value=date.today())
+        data_fim = st.date_input("Data fim", value=date.today())
+
+    if st.button("Buscar e salvar"):
+        di, df = data_inicio.strftime("%d-%m-%Y"), data_fim.strftime("%d-%m-%Y")
+        with st.spinner("Consultando CDR sintético..."):
+            linhas_cdr = consultar_cdr(numero, di, df)
+        with st.spinner("Consultando recusas na P.A..."):
+            di2, df2 = data_inicio.strftime("%Y-%m-%d"), data_fim.strftime("%Y-%m-%d")
+            linhas_recusa = consultar_recusa_pa(fila_id, di2, df2)
+
+        salvar_linhas(conn, linhas_cdr + linhas_recusa)
+        st.success(f"Salvo: {len(linhas_cdr)} linhas de CDR + {len(linhas_recusa)} linhas de recusa-PA")
+        st.dataframe(pd.DataFrame(linhas_cdr + linhas_recusa))
+
+with tab_busca:
+    st.subheader("Timeline completa de um número")
+    numero_busca = st.text_input("Telefone para auditar", key="busca_telefone")
+    if st.button("Auditar número"):
+        df = pd.read_sql_query(
+            "SELECT * FROM chamadas WHERE numero_origem LIKE ? OR numero_destino LIKE ? ORDER BY data_hora",
+            conn, params=(f"%{numero_busca}%", f"%{numero_busca}%")
+        )
+        if df.empty:
+            st.warning("Nenhum registro encontrado para esse número (colete os dados na aba anterior primeiro).")
+        else:
+            df["classificacao_estimada"] = df["duracao"].apply(classificar)
+            st.dataframe(df[["data_hora", "origem_relatorio", "tecnico", "ramal_destino",
+                              "status", "duracao", "classificacao_estimada"]])
+
+with tab_mensal:
+    st.subheader("Resumo mensal por técnico")
+    mes = st.text_input("Filtro de mês (formato livre, ex: 2026-07)", "")
+    query = "SELECT * FROM chamadas"
+    params = ()
+    if mes:
+        query += " WHERE data_hora LIKE ?"
+        params = (f"%{mes}%",)
+    df = pd.read_sql_query(query, conn, params=params)
+
+    if df.empty:
+        st.warning("Sem dados coletados ainda.")
+    else:
+        resumo = df.groupby(["tecnico", "status"]).size().reset_index(name="quantidade")
+        st.dataframe(resumo)
+
+        fig = px.bar(resumo, x="tecnico", y="quantidade", color="status",
+                     title="Chamadas por técnico e status", barmode="group")
+        st.plotly_chart(fig, use_container_width=True)
+
+        csv = df.to_csv(index=False).encode("utf-8")
+        st.download_button("Baixar CSV para planilha de desempenho", csv,
+                            "relatorio_mensal_pabx.csv", "text/csv")
