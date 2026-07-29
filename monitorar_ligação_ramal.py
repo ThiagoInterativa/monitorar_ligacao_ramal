@@ -1,6 +1,6 @@
 """
 Auditoria PABX Evence
-=======================
+======================
 Faz login no painel (sessão + CSRF), consulta os relatórios:
   - CDR sintético (/cdr/pesquisar)         -> filtra por telefone/data
   - Recusas na P.A. (/callcenter/relatorios/recusa-pa) -> filtra por fila/data
@@ -225,10 +225,13 @@ def buscar_paginado(url_base):
 # ============================================================
 # CONSULTAS ESPECÍFICAS
 # ============================================================
-def consultar_cdr(numero, data_inicial, data_final, ramal_destino=""):
+def consultar_cdr(numero, data_inicial, data_final, ramal_destino="", tipo_chamada="IN"):
+    """tipo_chamada: 'IN' = recebidas, 'OUT' = originadas, '' = todas.
+    Deixe numero_origem vazio para trazer TODAS as recebidas do dia
+    (útil pra auditoria geral, não só de um telefone específico)."""
     url = (f"{CDR_URL}?ramal_origem=&numero_origem={numero}&ramal_destino={ramal_destino}"
-           f"&numero_destino=&did=&status_chamada=&centrocusto_id=&tipo_chamada=&gravacao="
-           f"&discador=0&data_inicial={data_inicial}&data_final={data_final}")
+           f"&numero_destino=&did=&status_chamada=&centrocusto_id=&tipo_chamada={tipo_chamada}"
+           f"&gravacao=&discador=0&data_inicial={data_inicial}&data_final={data_final}")
     registros = buscar_paginado(url)
 
     linhas = []
@@ -269,6 +272,38 @@ def consultar_recusa_pa(fila_id, data_inicial, data_final):
             "raw_linha": r.get("_raw"),
         })
     return linhas
+
+
+# ============================================================
+# API OFICIAL (token) - contadores em tempo real da fila
+# ============================================================
+def get_api_token():
+    try:
+        return st.secrets["pabx"]["api_token"]
+    except Exception:
+        return os.environ.get("PABX_API_TOKEN", "")
+
+
+def consultar_api_queue_stats(fila_id):
+    """Usa /api/v1/queues/stats (com api_token) para pegar os contadores
+    oficiais da fila (atendidas, abandonadas, TME, TMA). Serve como
+    conferência: se os contadores oficiais não baterem com o que o
+    scraping dos relatórios trouxe, há algo a investigar na coleta."""
+    token = get_api_token()
+    if not token:
+        st.warning("api_token não configurado (secrets.toml -> [pabx] api_token = '...') — pulando conferência via API.")
+        return None
+    url = f"{BASE_URL}/api/v1/queues/stats?api_token={token}&queue={fila_id}"
+    try:
+        resp = requests.get(url, timeout=15)
+        data = resp.json()
+        if "error" in data:
+            st.error(f"Erro da API: {data['error']}")
+            return None
+        return data.get("queueList")
+    except requests.RequestException as e:
+        st.error(f"Erro ao consultar API: {e}")
+        return None
 
 
 # ============================================================
@@ -314,16 +349,22 @@ with tab_coleta:
     st.subheader("Coletar dados dos relatórios e salvar no banco local")
     col1, col2 = st.columns(2)
     with col1:
-        numero = st.text_input("Telefone do cliente (numero_origem no CDR)", "1143820682")
+        numero = st.text_input(
+            "Telefone do cliente (numero_origem no CDR) — deixe vazio para trazer TODAS as recebidas do dia",
+            ""
+        )
         fila_id = st.text_input("Fila ID", "2812")
     with col2:
         data_inicio = st.date_input("Data início", value=date.today())
         data_fim = st.date_input("Data fim", value=date.today())
 
+    tipo_chamada = st.selectbox("Tipo de chamada (CDR)", ["IN", "OUT", ""], index=0,
+                                 help="IN = recebidas (o que você quer auditar), OUT = originadas, vazio = todas")
+
     if st.button("Buscar e salvar"):
         di, df = data_inicio.strftime("%d-%m-%Y"), data_fim.strftime("%d-%m-%Y")
         with st.spinner("Consultando CDR sintético..."):
-            linhas_cdr = consultar_cdr(numero, di, df)
+            linhas_cdr = consultar_cdr(numero, di, df, tipo_chamada=tipo_chamada)
         with st.spinner("Consultando recusas na P.A..."):
             di2, df2 = data_inicio.strftime("%Y-%m-%d"), data_fim.strftime("%Y-%m-%d")
             linhas_recusa = consultar_recusa_pa(fila_id, di2, df2)
@@ -331,6 +372,18 @@ with tab_coleta:
         salvar_linhas(conn, linhas_cdr + linhas_recusa)
         st.success(f"Salvo: {len(linhas_cdr)} linhas de CDR + {len(linhas_recusa)} linhas de recusa-PA")
         st.dataframe(pd.DataFrame(linhas_cdr + linhas_recusa))
+
+        with st.spinner("Conferindo contadores oficiais via API..."):
+            stats = consultar_api_queue_stats(fila_id)
+        if stats:
+            st.subheader("Conferência (API oficial /queues/stats — dados atuais da fila)")
+            c1, c2, c3, c4 = st.columns(4)
+            c1.metric("Atendidas (total)", stats.get("totalChamadasAtendidas", "-"))
+            c2.metric("Abandonadas (total)", stats.get("totalChamadasAbandonadas", "-"))
+            c3.metric("TME", stats.get("TME", "-"))
+            c4.metric("TMA", stats.get("TMA", "-"))
+            st.caption("Nota: a API traz contadores acumulados atuais da fila, não filtrados por data — "
+                       "use apenas como conferência de consistência, não como fonte do relatório mensal.")
 
 with tab_busca:
     st.subheader("Timeline completa de um número")
