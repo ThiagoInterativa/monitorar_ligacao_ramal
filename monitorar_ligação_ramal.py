@@ -61,8 +61,8 @@ def init_db(reset=False):
     conn.execute("""
         CREATE TABLE IF NOT EXISTS chamadas (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
-            origem_relatorio TEXT,       -- 'api_cdr', 'cdr_web' ou 'recusa_pa'
-            call_id TEXT,                -- Identificador único do salto/chamada
+            origem_relatorio TEXT,        -- 'api_cdr', 'cdr_web' ou 'recusa_pa'
+            call_id TEXT,                 -- Identificador único do salto/chamada
             data_hora TEXT,
             numero_origem TEXT,
             numero_destino TEXT,
@@ -196,9 +196,14 @@ def extrair_tabela(html):
         if not celulas:
             continue
         valores = [c.get_text().strip() for c in celulas]
+        
+        # Ajuste dinâmico se a quantidade de colunas coincidir ou mapeamento flexível
         if len(valores) != len(cabecalhos):
-            continue
-        registro = dict(zip(cabecalhos, valores))
+            # Se o número de colunas divergir do thead, cria chaves genéricas baseadas na posição
+            registro = {f"col_{i}": val for i, val in enumerate(valores)}
+        else:
+            registro = dict(zip(cabecalhos, valores))
+            
         registro["_raw"] = valores
         registros.append(registro)
 
@@ -329,26 +334,29 @@ def consultar_recusa_pa_web(fila_id, data_inicial, data_final, numero_filtro=Non
 
     linhas = []
     for r in registros:
-        bina = r.get("bina") or r.get("numero") or r.get("cliente") or r.get("origem")
-        
+        # Mapeamento robusto considerando cabeçalhos tradicionais ou posicional (caso venha col_0, col_1...)
+        data_hora = r.get("data/hora") or r.get("data") or r.get("col_0")
+        fila_val = r.get("fila") or r.get("col_1") or fila_id
+        agente = r.get("agente") or r.get("tecnico") or r.get("col_2")
+        call_id = r.get("call id") or r.get("id") or r.get("col_3")
+        bina = r.get("bina") or r.get("numero") or r.get("cliente") or r.get("origem") or r.get("col_4")
+        duracao = r.get("duracao") or r.get("tempo") or r.get("col_5")
+
         if numero_filtro and numero_filtro.strip():
-            if not bina or numero_filtro.strip() not in bina:
+            if not bina or numero_filtro.strip() not in str(bina):
                 continue
 
-        tecnico_val = r.get("agente") or r.get("tecnico")
-        fila_val = r.get("fila") or fila_id
-        
         linhas.append({
             "origem_relatorio": "recusa_pa",
-            "call_id": r.get("call id") or r.get("id"),
-            "data_hora": r.get("data") or r.get("data/hora"),
+            "call_id": call_id,
+            "data_hora": data_hora,
             "numero_origem": bina,
             "numero_destino": None,
             "ramal_origem": None,
-            "ramal_destino": r.get("ramal"),
-            "tecnico": tecnico_val,
-            "status": f"Recusada / {fila_val}",
-            "duracao": r.get("duracao") or r.get("tempo"),
+            "ramal_destino": None,
+            "tecnico": agente,
+            "status": f"Recusada / Fila {fila_val}",
+            "duracao": duracao,
             "fila_id": fila_val,
             "raw_linha": r.get("_raw"),
         })
@@ -367,7 +375,7 @@ if st.sidebar.button("⚠️ Resetar Base de Dados"):
     st.sidebar.success("Base limpa!")
 
 tab_busca, tab_coleta, tab_mensal = st.tabs(
-    ["🔎 Auditoria por Telefone (Histórico Cruzado)", "⬇️ Coletar Todas as Fontes", "📅 Fechamento Mensal"]
+    ["🔎 Auditoria por Telefone (Histórico Cruzado)", "⬇️ Coletar Todas las Fontes", "📅 Fechamento Mensal"]
 )
 
 with tab_coleta:
