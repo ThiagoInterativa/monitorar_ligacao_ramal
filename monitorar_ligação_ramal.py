@@ -171,40 +171,37 @@ def _normalizar(texto):
     texto = unicodedata.normalize("NFKD", texto).encode("ascii", "ignore").decode()
     return texto.strip().lower()
 
-
 def extrair_tabela(html):
     soup = BeautifulSoup(html, "html.parser")
     tabela = soup.find("table")
     if not tabela:
         return [], 1
 
-    thead = tabela.find("thead")
-    if thead:
-        cabecalhos = [_normalizar(th.get_text()) for th in thead.find_all("th")]
-    else:
-        primeira_linha = tabela.find("tr")
-        if not primeira_linha:
-            return [], 1
-        cabecalhos = [_normalizar(td.get_text()) for td in primeira_linha.find_all(["th", "td"])]
-
     corpo = tabela.find("tbody") or tabela
     linhas_html = corpo.find_all("tr")
 
     registros = []
     for linha in linhas_html:
-        celulas = linha.find_all("td")
+        celulas = linha.find_all(["td", "th"])
         if not celulas:
             continue
         valores = [c.get_text().strip() for c in celulas]
         
-        # Ajuste dinâmico se a quantidade de colunas coincidir ou mapeamento flexível
-        if len(valores) != len(cabecalhos):
-            # Se o número de colunas divergir do thead, cria chaves genéricas baseadas na posição
-            registro = {f"col_{i}": val for i, val in enumerate(valores)}
-        else:
-            registro = dict(zip(cabecalhos, valores))
-            
-        registro["_raw"] = valores
+        # Ignora linhas que sejam cabeçalhos repetidos dentro do tbody
+        if any("data" in _normalizar(v) for v in valores[:2]) and len(registros) == 0:
+            continue
+
+        # Mapeamento posicional direto para garantir que nenhuma coluna se perca
+        # Ordem esperada baseada no seu exemplo: [Data/Hora, Fila, Agente, Call ID, Bina, Duração]
+        registro = {
+            "col_0": valores[0] if len(valores) > 0 else "", # Data/Hora
+            "col_1": valores[1] if len(valores) > 1 else "", # Fila
+            "col_2": valores[2] if len(valores) > 2 else "", # Agente
+            "col_3": valores[3] if len(valores) > 3 else "", # Call ID
+            "col_4": valores[4] if len(valores) > 4 else "", # Bina
+            "col_5": valores[5] if len(valores) > 5 else "", # Duração
+            "_raw": valores
+        }
         registros.append(registro)
 
     ultima_pagina = 1
