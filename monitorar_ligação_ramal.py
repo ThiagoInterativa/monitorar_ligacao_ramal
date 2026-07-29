@@ -141,15 +141,18 @@ df_geral = carregar_do_banco(data_inicio, data_fim)
 # ==========================================
 # AUDITORIA DE ROTA POR TELEFONE
 # ==========================================
-if menu == "🔍 Auditoria de Rota por Telefone":
-    st.subheader("🔍 Trilha e Auditoria Completa de Rota de Chamada")
-    st.markdown("Digite o número do telefone do cliente para rastrear **por onde a ligação passou** (qual ramal tocou primeiro, se foi recusada, se foi para outro técnico ou se ficou abandonada).")
+# ==========================================
+# OPÇÃO 2: AUDITORIA DE ROTA POR TELEFONE
+# ==========================================
+if menu == "🔍 Auditoria de Log por Telefone":
+    st.subheader("🔍 Rastreio e Trilha Completa da Chamada")
+    st.markdown("Digite o número do telefone do cliente para rastrear todos os eventos próximos e a rota que a ligação fez.")
     
-    telefone_busca = st.text_input("Número do Telefone do Cliente (Ex: 1126260149 ou parte dele):", "")
+    telefone_busca = st.text_input("Número do Telefone do Cliente (Ex: 1143820682):", "")
     
     if telefone_busca:
         if not df_geral.empty:
-            # Filtro seguro e direto em todas as colunas relevantes
+            # 1. Encontra chamadas que contêm o número do cliente
             df_cliente = df_geral[
                 df_geral["origem"].astype(str).str.contains(telefone_busca, na=False) | 
                 df_geral["destino"].astype(str).str.contains(telefone_busca, na=False) |
@@ -158,39 +161,55 @@ if menu == "🔍 Auditoria de Rota por Telefone":
             ]
             
             if not df_cliente.empty:
-                st.success(f"Encontrados **{len(df_cliente)}** registros de eventos no PABX para o número/termo: **{telefone_busca}**")
-                df_cliente = df_cliente.sort_values(by="data_obj", ascending=True)
+                st.success(f"Encontrados **{len(df_cliente)}** eventos diretos para o número **{telefone_busca}**")
                 
-                st.markdown("### 🗺️ Rota Cronológica da Chamada (O que aconteceu?)")
+                # 2. JANELA DE AUDITORIA EXPANDIDA: Pega também os eventos que ocorreram no mesmo dia/horário (para achar ramais, intercom e filas próximas)
+                primeira_data = df_cliente["data_obj"].min()
+                ultima_data = df_cliente["data_obj"].max()
                 
-                for idx, row in df_cliente.iterrows():
-                    status = str(row["status"]).lower()
+                if pd.notnull(primeira_data) and pd.notnull(ultima_data):
+                    # Expande a janela em 10 minutos antes e depois para capturar o contexto da rota
+                    janela_inicio = primeira_data - pd.Timedelta(minutes=5)
+                    janela_fim = ultima_data + pd.Timedelta(minutes=30)
                     
-                    # Identificação visual inteligente do evento
+                    df_rota_completa = df_geral[
+                        (df_geral["data_obj"] >= janela_inicio) & 
+                        (df_geral["data_obj"] <= janela_fim)
+                    ].sort_values(by="data_obj", ascending=True)
+                else:
+                    df_rota_completa = df_cliente
+
+                st.markdown("### 🗺️ Rota Cronológica Contextualizada (O que aconteceu ao redor?)")
+                st.info("Mostrando eventos do PABX na mesma janela de horário para identificar ramais, transferências e interações da equipe.")
+                
+                for idx, row in df_rota_completa.iterrows():
+                    status = str(row["status"]).lower()
+                    is_alvo = telefone_busca in str(row["detalhes_brutos"])
+                    
+                    # Destaque visual se o evento pertencer diretamente ao cliente ou ao contexto
+                    prefixo_destaque = "⭐ **[CHAMADA DO CLIENTE]**" if is_alvo else "🔄 **[Evento de Contexto / Ramal / Fila]**"
+                    
                     if "atendida" in status:
-                        icone = "🟢 [ATENDIDA]"
+                        icone = "🟢"
                     elif "abandonada" in status:
-                        icone = "🔴 [ABANDONADA / NÃO ATENDIDA]"
-                    elif "recusada" in status or "intercom" in row["tipo"].lower():
-                        icone = "🟠 [RECUSADA / TRANSFERIDA]"
+                        icone = "🔴"
                     else:
-                        icone = "🔵 [EVENTO DE PABX]"
+                        icone = "🟠"
                     
                     st.markdown(f"""
                     ---
-                    #### {icone} — `{row['data_hora']}`
-                    * **Origem (Quem ligou / Canal):** `{row['origem']}`
-                    * **Destino (Ramal / Fila / Atendente):** `{row['destino']}`
-                    * **Canal / Ramal Envolvido:** `{row['canal_ramal']}`
-                    * **Status do PABX:** `{row['status']}` | **Tipo:** `{row['tipo']}` | **Duração:** `{row['duracao']}`
-                    * *Dados Brutos do Salto:* `{row['detalhes_brutos']}`
+                    {prefixo_destaque}  
+                    * **{icone} Data/Hora:** `{row['data_hora']}`  
+                    * **Origem:** `{row['origem']}` | **Destino:** `{row['destino']}`  
+                    * **Canal/Ramal:** `{row['canal_ramal']}` | **Status:** `{row['status']}` | **Tipo:** `{row['tipo']}` | **Duração:** `{row['duracao']}`  
+                    * *Dados Brutos:* `{row['detalhes_brutos']}`
                     """)
                 
                 st.markdown("---")
-                st.subheader("Tabela Analítica Bruta para Conferência")
-                st.dataframe(df_cliente[["data_hora", "origem", "destino", "canal_ramal", "status", "tipo", "duracao"]])
+                st.subheader("Tabela Analítica da Janela da Chamada")
+                st.dataframe(df_rota_completa[["data_hora", "origem", "destino", "canal_ramal", "status", "tipo", "duracao"]])
             else:
-                st.warning(f"Nenhum evento encontrado para '{telefone_busca}' no período selecionado.")
+                st.warning(f"Nenhum evento direto encontrado para '{telefone_busca}'. Verifique se sincronizou a data correta.")
         else:
             st.warning("O banco de dados está vazio. Sincronize os dados da API primeiro.")
             
