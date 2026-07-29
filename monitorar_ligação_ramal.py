@@ -192,12 +192,12 @@ def extrair_tabela(html):
 
     registros = []
     for linha in linhas_html:
-        celulas = linha.find_all("td")
+        celulas = linha.find_all(["td", "th"])
         if not celulas:
             continue
         valores = [c.get_text().strip() for c in celulas]
         
-        # Mapeamento híbrido: tenta por nome se o tamanho bater, mas sempre inclui col_i posicional
+        # Mapeamento híbrido: tenta por nome e cria colunas posicionais col_0, col_1...
         registro = {}
         if len(valores) == len(cabecalhos):
             registro = dict(zip(cabecalhos, valores))
@@ -221,7 +221,8 @@ def extrair_tabela(html):
             ultima_pagina = max(numeros)
 
     return registros, ultima_pagina
-  
+
+
 def buscar_paginado(url_base):
     resp = fetch_with_relogin(url_base)
     if resp is None or resp.status_code != 200:
@@ -243,9 +244,22 @@ def buscar_paginado(url_base):
 def parse_tecnico_ramal(texto_destino):
     if not texto_destino:
         return None, None
+    
+    # Se o texto for puramente um número de telefone ou ramal puro (somente dígitos longos), não é um nome de técnico
+    if texto_destino.isdigit() and len(texto_destino) > 4:
+        return None, None
+
     match = re.search(r"^(.*?)\s*<\s*(\d+)\s*>$", texto_destino)
     if match:
-        return match.group(1).strip(), match.group(2).strip()
+        nome = match.group(1).strip()
+        ramal = match.group(2).strip()
+        if nome.isdigit() and len(nome) > 4:
+            return None, ramal
+        return nome, ramal
+    
+    if texto_destino.isdigit():
+        return None, texto_destino
+        
     return texto_destino, None
 
 
@@ -300,7 +314,6 @@ def consultar_api_cdr(data_inicio_str, data_fim_str):
     return linhas
 
 
-
 def consultar_cdr_web(numero, data_inicial, data_final, tipo_chamada="IN"):
     url = (f"{CDR_URL}?ramal_origem=&numero_origem={numero}&ramal_destino="
            f"&numero_destino=&did=&status_chamada=&centrocusto_id=&tipo_chamada={tipo_chamada}"
@@ -309,16 +322,16 @@ def consultar_cdr_web(numero, data_inicial, data_final, tipo_chamada="IN"):
     registros = buscar_paginado(url)
     linhas = []
     for r in registros:
-        # Tenta buscar o destino por várias chaves possíveis ou colunas posicionais genéricas (ex: col_3, col_4...)
+        # Busca o destino bruto de colunas web comuns ou posicionais
         dest_bruto = (
             r.get("destino") or r.get("ramal destino") or r.get("ramal") or 
             r.get("col_3") or r.get("col_4") or r.get("col_5")
         )
         tecnico, ramal_dest = parse_tecnico_ramal(dest_bruto)
         
-        # Se o técnico ainda vier vazio, tenta pegar de chaves alternativas comuns em CDRs web
-        if not tecnico:
-            tecnico = r.get("agente") or r.get("tecnico") or r.get("operador")
+        # Garante que números de telefone capturados acidentalmente não passem como nome de técnico
+        if tecnico and tecnico.isdigit():
+            tecnico = None
 
         data_hora = (
             r.get("data") or r.get("data/hora") or r.get("data hora") or 
@@ -343,7 +356,7 @@ def consultar_cdr_web(numero, data_inicial, data_final, tipo_chamada="IN"):
             "raw_linha": r.get("_raw"),
         })
     return linhas
-  
+
 
 def consultar_recusa_pa_web(fila_id, data_inicial, data_final, numero_filtro=None):
     url = f"{RECUSA_PA_URL}?fila_id={fila_id}&data_inicial={data_inicial}&data_final={data_final}"
@@ -351,7 +364,6 @@ def consultar_recusa_pa_web(fila_id, data_inicial, data_final, numero_filtro=Non
 
     linhas = []
     for r in registros:
-        # Mapeamento robusto considerando cabeçalhos tradicionais ou posicional (caso venha col_0, col_1...)
         data_hora = r.get("data/hora") or r.get("data") or r.get("col_0")
         fila_val = r.get("fila") or r.get("col_1") or fila_id
         agente = r.get("agente") or r.get("tecnico") or r.get("col_2")
@@ -392,7 +404,7 @@ if st.sidebar.button("⚠️ Resetar Base de Dados"):
     st.sidebar.success("Base limpa!")
 
 tab_busca, tab_coleta, tab_mensal = st.tabs(
-    ["🔎 Auditoria por Telefone (Histórico Cruzado)", "⬇️ Coletar Todas las Fontes", "📅 Fechamento Mensal"]
+    ["🔎 Auditoria por Telefone (Histórico Cruzado)", "⬇️ Coletar Todas as Fontes", "📅 Fechamento Mensal"]
 )
 
 with tab_coleta:
