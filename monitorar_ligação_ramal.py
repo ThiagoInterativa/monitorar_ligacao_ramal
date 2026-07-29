@@ -297,6 +297,7 @@ def consultar_api_cdr(data_inicio_str, data_fim_str):
     return linhas
 
 
+
 def consultar_cdr_web(numero, data_inicial, data_final, tipo_chamada="IN"):
     url = (f"{CDR_URL}?ramal_origem=&numero_origem={numero}&ramal_destino="
            f"&numero_destino=&did=&status_chamada=&centrocusto_id=&tipo_chamada={tipo_chamada}"
@@ -305,25 +306,41 @@ def consultar_cdr_web(numero, data_inicial, data_final, tipo_chamada="IN"):
     registros = buscar_paginado(url)
     linhas = []
     for r in registros:
-        dest_bruto = r.get("destino") or r.get("ramal destino") or r.get("ramal")
+        # Tenta buscar o destino por várias chaves possíveis ou colunas posicionais genéricas (ex: col_3, col_4...)
+        dest_bruto = (
+            r.get("destino") or r.get("ramal destino") or r.get("ramal") or 
+            r.get("col_3") or r.get("col_4") or r.get("col_5")
+        )
         tecnico, ramal_dest = parse_tecnico_ramal(dest_bruto)
         
+        # Se o técnico ainda vier vazio, tenta pegar de chaves alternativas comuns em CDRs web
+        if not tecnico:
+            tecnico = r.get("agente") or r.get("tecnico") or r.get("operador")
+
+        data_hora = (
+            r.get("data") or r.get("data/hora") or r.get("data hora") or 
+            r.get("col_0") or r.get("col_1")
+        )
+        call_id = r.get("call id") or r.get("id") or r.get("call_id")
+        status_val = r.get("status") or r.get("status chamada") or r.get("col_6")
+        duracao_val = r.get("duracao") or r.get("tempo") or r.get("col_7")
+
         linhas.append({
             "origem_relatorio": "cdr_web",
-            "call_id": r.get("call id") or r.get("id"),
-            "data_hora": r.get("data") or r.get("data/hora") or r.get("data hora"),
+            "call_id": call_id,
+            "data_hora": data_hora,
             "numero_origem": r.get("origem") or numero,
             "numero_destino": r.get("destino_numero") or None,
             "ramal_origem": r.get("ramal origem"),
             "ramal_destino": ramal_dest,
             "tecnico": tecnico,
-            "status": r.get("status") or r.get("status chamada"),
-            "duracao": r.get("duracao") or r.get("tempo"),
+            "status": status_val,
+            "duracao": duracao_val,
             "fila_id": r.get("fila"),
             "raw_linha": r.get("_raw"),
         })
     return linhas
-
+  
 
 def consultar_recusa_pa_web(fila_id, data_inicial, data_final, numero_filtro=None):
     url = f"{RECUSA_PA_URL}?fila_id={fila_id}&data_inicial={data_inicial}&data_final={data_final}"
