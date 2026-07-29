@@ -141,11 +141,8 @@ if menu == "🔍 Auditoria de Rota por Telefone":
     
     if telefone_busca:
         if not df_geral.empty:
-            # Filtro amplo para capturar origem, destino ou canal contendo o número
+            # Filtro seguro e direto em todas as colunas relevantes
             df_cliente = df_geral[
-                df_geral["origem"].astype(str).str.contains(telefone_busca, na=False) | 
-                df_cliente_coluna_segura(df_geral, telefone_busca)
-            ] if 'df_cliente_coluna_segura' else df_geral[
                 df_geral["origem"].astype(str).str.contains(telefone_busca, na=False) | 
                 df_geral["destino"].astype(str).str.contains(telefone_busca, na=False) |
                 df_geral["canal_ramal"].astype(str).str.contains(telefone_busca, na=False) |
@@ -188,7 +185,7 @@ if menu == "🔍 Auditoria de Rota por Telefone":
                 st.warning(f"Nenhum evento encontrado para '{telefone_busca}' no período selecionado.")
         else:
             st.warning("O banco de dados está vazio. Sincronize os dados da API primeiro.")
-
+            
 elif menu == "📊 Resumo Geral":
     st.subheader("📊 Visão Geral do Sistema")
     if not df_geral.empty:
