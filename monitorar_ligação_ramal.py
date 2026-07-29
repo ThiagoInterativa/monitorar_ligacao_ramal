@@ -1,6 +1,6 @@
 """
 Auditoria PABX Evence
-======================
+=======================
 Faz login no painel (sessão + CSRF), consulta os relatórios:
   - CDR sintético (/cdr/pesquisar)         -> filtra por telefone/data
   - Recusas na P.A. (/callcenter/relatorios/recusa-pa) -> filtra por fila/data
